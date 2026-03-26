@@ -2759,7 +2759,16 @@ var allAzureVMSkus = []skewer.SKU{
 		Name: ptr.To("Standard_HX176rs"),
 	},
 	{
+		Name: ptr.To("Standard_L12aos_v4"),
+	},
+	{
 		Name: ptr.To("Standard_L16as_v3"),
+	},
+	{
+		Name: ptr.To("Standard_L16as_v4"),
+	},
+	{
+		Name: ptr.To("Standard_L16aos_v4"),
 	},
 	{
 		Name: ptr.To("Standard_L16s"),
@@ -2771,7 +2780,28 @@ var allAzureVMSkus = []skewer.SKU{
 		Name: ptr.To("Standard_L16s_v3"),
 	},
 	{
+		Name: ptr.To("Standard_L16s_v4"),
+	},
+	{
+		Name: ptr.To("Standard_L24aos_v4"),
+	},
+	{
+		Name: ptr.To("Standard_L2aos_v4"),
+	},
+	{
+		Name: ptr.To("Standard_L2as_v4"),
+	},
+	{
+		Name: ptr.To("Standard_L2s_v4"),
+	},
+	{
 		Name: ptr.To("Standard_L32as_v3"),
+	},
+	{
+		Name: ptr.To("Standard_L32as_v4"),
+	},
+	{
+		Name: ptr.To("Standard_L32aos_v4"),
 	},
 	{
 		Name: ptr.To("Standard_L32s"),
@@ -2783,7 +2813,13 @@ var allAzureVMSkus = []skewer.SKU{
 		Name: ptr.To("Standard_L32s_v3"),
 	},
 	{
+		Name: ptr.To("Standard_L32s_v4"),
+	},
+	{
 		Name: ptr.To("Standard_L48as_v3"),
+	},
+	{
+		Name: ptr.To("Standard_L48as_v4"),
 	},
 	{
 		Name: ptr.To("Standard_L48s_v2"),
@@ -2792,10 +2828,25 @@ var allAzureVMSkus = []skewer.SKU{
 		Name: ptr.To("Standard_L48s_v3"),
 	},
 	{
+		Name: ptr.To("Standard_L48s_v4"),
+	},
+	{
+		Name: ptr.To("Standard_L4aos_v4"),
+	},
+	{
+		Name: ptr.To("Standard_L4as_v4"),
+	},
+	{
 		Name: ptr.To("Standard_L4s"),
 	},
 	{
+		Name: ptr.To("Standard_L4s_v4"),
+	},
+	{
 		Name: ptr.To("Standard_L64as_v3"),
+	},
+	{
+		Name: ptr.To("Standard_L64as_v4"),
 	},
 	{
 		Name: ptr.To("Standard_L64s_v2"),
@@ -2804,7 +2855,13 @@ var allAzureVMSkus = []skewer.SKU{
 		Name: ptr.To("Standard_L64s_v3"),
 	},
 	{
+		Name: ptr.To("Standard_L64s_v4"),
+	},
+	{
 		Name: ptr.To("Standard_L80as_v3"),
+	},
+	{
+		Name: ptr.To("Standard_L80as_v4"),
 	},
 	{
 		Name: ptr.To("Standard_L80s_v2"),
@@ -2813,7 +2870,16 @@ var allAzureVMSkus = []skewer.SKU{
 		Name: ptr.To("Standard_L80s_v3"),
 	},
 	{
+		Name: ptr.To("Standard_L80s_v4"),
+	},
+	{
 		Name: ptr.To("Standard_L8as_v3"),
+	},
+	{
+		Name: ptr.To("Standard_L8aos_v4"),
+	},
+	{
+		Name: ptr.To("Standard_L8as_v4"),
 	},
 	{
 		Name: ptr.To("Standard_L8s"),
@@ -2823,6 +2889,15 @@ var allAzureVMSkus = []skewer.SKU{
 	},
 	{
 		Name: ptr.To("Standard_L8s_v3"),
+	},
+	{
+		Name: ptr.To("Standard_L8s_v4"),
+	},
+	{
+		Name: ptr.To("Standard_L96as_v4"),
+	},
+	{
+		Name: ptr.To("Standard_L96s_v4"),
 	},
 	{
 		Name: ptr.To("Standard_M128"),
