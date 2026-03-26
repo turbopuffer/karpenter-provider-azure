@@ -117,20 +117,17 @@ func (u AzureLinux3) DefaultImages(useSIG bool, fipsMode *v1beta1.FIPSMode) []ty
 		},
 	}
 
-	if useSIG {
-		// AzLinux3 ARM64 VHD is not available in CIG right now
-		images = append(images, types.DefaultImageOutput{
-			PublicGalleryURL:     AKSAzureLinuxPublicGalleryURL,
-			GalleryResourceGroup: AKSAzureLinuxResourceGroup,
-			GalleryName:          AKSAzureLinuxGalleryName,
-			ImageDefinition:      AzureLinux3Gen2ArmImageDefinition,
-			Requirements: scheduling.NewRequirements(
-				scheduling.NewRequirement(v1.LabelArchStable, v1.NodeSelectorOpIn, karpv1.ArchitectureArm64),
-				scheduling.NewRequirement(v1beta1.LabelSKUHyperVGeneration, v1.NodeSelectorOpIn, v1beta1.HyperVGenerationV2),
-			),
-			Distro: "aks-azurelinux-v3-arm64-gen2",
-		})
-	}
+	images = append(images, types.DefaultImageOutput{
+		PublicGalleryURL:     AKSAzureLinuxPublicGalleryURL,
+		GalleryResourceGroup: AKSAzureLinuxResourceGroup,
+		GalleryName:          AKSAzureLinuxGalleryName,
+		ImageDefinition:      AzureLinux3Gen2ArmImageDefinition,
+		Requirements: scheduling.NewRequirements(
+			scheduling.NewRequirement(v1.LabelArchStable, v1.NodeSelectorOpIn, karpv1.ArchitectureArm64),
+			scheduling.NewRequirement(v1beta1.LabelSKUHyperVGeneration, v1.NodeSelectorOpIn, v1beta1.HyperVGenerationV2),
+		),
+		Distro: "aks-azurelinux-v3-arm64-gen2",
+	})
 
 	return images
 }
