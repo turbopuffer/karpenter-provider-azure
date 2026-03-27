@@ -79,29 +79,30 @@ func (u AzureLinux) DefaultImages(useSIG bool, fipsMode *v1beta1.FIPSMode) []typ
 			},
 		}
 	}
-	// image provider will select these images in order, first match wins. This is why we chose to put Gen2 first in the defaultImages, as we prefer gen2 over gen1
+	// Use AzureLinux3 for x64 (has NVMe disk controller support in CIG, needed for NVMe-only VMs like L-series v4)
+	// Use AzureLinux2 for ARM64 (AzureLinux3 V3gen2arm64 CIG image has incorrect x64 metadata, see azure/aks#5670)
 	return []types.DefaultImageOutput{
 		{
 			PublicGalleryURL:     AKSAzureLinuxPublicGalleryURL,
 			GalleryResourceGroup: AKSAzureLinuxResourceGroup,
 			GalleryName:          AKSAzureLinuxGalleryName,
-			ImageDefinition:      AzureLinuxGen2ImageDefinition,
+			ImageDefinition:      AzureLinux3Gen2ImageDefinition,
 			Requirements: scheduling.NewRequirements(
 				scheduling.NewRequirement(v1.LabelArchStable, v1.NodeSelectorOpIn, karpv1.ArchitectureAmd64),
 				scheduling.NewRequirement(v1beta1.LabelSKUHyperVGeneration, v1.NodeSelectorOpIn, v1beta1.HyperVGenerationV2),
 			),
-			Distro: "aks-azurelinux-v2-gen2",
+			Distro: "aks-azurelinux-v3-gen2",
 		},
 		{
 			PublicGalleryURL:     AKSAzureLinuxPublicGalleryURL,
 			GalleryResourceGroup: AKSAzureLinuxResourceGroup,
 			GalleryName:          AKSAzureLinuxGalleryName,
-			ImageDefinition:      AzureLinuxGen1ImageDefinition,
+			ImageDefinition:      AzureLinux3Gen1ImageDefinition,
 			Requirements: scheduling.NewRequirements(
 				scheduling.NewRequirement(v1.LabelArchStable, v1.NodeSelectorOpIn, karpv1.ArchitectureAmd64),
 				scheduling.NewRequirement(v1beta1.LabelSKUHyperVGeneration, v1.NodeSelectorOpIn, v1beta1.HyperVGenerationV1),
 			),
-			Distro: "aks-azurelinux-v2",
+			Distro: "aks-azurelinux-v3",
 		},
 		{
 			PublicGalleryURL:     AKSAzureLinuxPublicGalleryURL,
