@@ -31,7 +31,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 
-	"github.com/Azure/azure-sdk-for-go/profiles/latest/compute/mgmt/compute"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	"github.com/patrickmn/go-cache"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -460,16 +459,8 @@ func FindMaxEphemeralSizeGBAndPlacement(sku *skewer.SKU) (sizeGB int64, placemen
 	return 0, nil
 }
 
-func isCompatibleImageAvailable(sku *skewer.SKU, useSIG bool) bool {
-	hasSCSISupport := func(sku *skewer.SKU) bool { // TODO: move capability determination to skewer
-		const diskControllerTypeCapability = "DiskControllerTypes"
-		declaresSCSI := sku.HasCapabilityWithSeparator(diskControllerTypeCapability, string(compute.SCSI))
-		declaresNVMe := sku.HasCapabilityWithSeparator(diskControllerTypeCapability, string(compute.NVMe))
-		declaresNothing := !declaresSCSI && !declaresNVMe
-		return declaresSCSI || declaresNothing // if nothing is declared, assume SCSI is supported
-	}
-
-	return useSIG || hasSCSISupport(sku) // CIG images are not currently tagged for NVMe
+func isCompatibleImageAvailable(_ *skewer.SKU, _ bool) bool {
+	return true // CIG images work on NVMe-only VMs despite not being tagged for it
 }
 
 func supportsNVMeEphemeralOSDisk(sku *skewer.SKU) bool {
