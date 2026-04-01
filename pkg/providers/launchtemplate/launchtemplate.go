@@ -18,6 +18,7 @@ package launchtemplate
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily"
@@ -26,6 +27,9 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
 	"github.com/samber/lo"
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/consts"
@@ -55,6 +59,7 @@ type Template struct {
 type Provider struct {
 	imageFamily             imagefamily.Resolver
 	imageProvider           imagefamily.NodeImageProvider
+	kubeClient              kubernetes.Interface
 	caBundle                *string
 	clusterEndpoint         string
 	tenantID                string
@@ -74,6 +79,7 @@ func NewProvider(
 	_ context.Context,
 	imageFamily imagefamily.Resolver,
 	imageProvider imagefamily.NodeImageProvider,
+	kubeClient kubernetes.Interface,
 	caBundle *string,
 	clusterEndpoint string,
 	tenantID,
@@ -87,6 +93,7 @@ func NewProvider(
 	return &Provider{
 		imageFamily:             imageFamily,
 		imageProvider:           imageProvider,
+		kubeClient:              kubeClient,
 		caBundle:                caBundle,
 		clusterEndpoint:         clusterEndpoint,
 		tenantID:                tenantID,
@@ -172,7 +179,7 @@ func (p *Provider) getStaticParameters(
 		Location:                       p.location,
 		ClusterID:                      options.FromContext(ctx).ClusterID,
 		APIServerName:                  options.FromContext(ctx).GetAPIServerName(),
-		KubeletClientTLSBootstrapToken: options.FromContext(ctx).KubeletClientTLSBootstrapToken,
+		KubeletClientTLSBootstrapToken: p.getBootstrapToken(ctx),
 		NetworkPlugin:                  getAgentbakerNetworkPlugin(ctx),
 		NetworkPolicy:                  options.FromContext(ctx).NetworkPolicy,
 		SubnetID:                       subnetID,
@@ -186,6 +193,37 @@ func getAgentbakerNetworkPlugin(ctx context.Context) string {
 		return consts.NetworkPluginNone
 	}
 	return consts.NetworkPluginAzure
+}
+
+// getBootstrapToken returns the bootstrap token for new nodes.
+// If KUBELET_BOOTSTRAP_TOKEN env var is set, it's used as an override.
+// Otherwise, reads the token fresh from kube-system bootstrap token secrets.
+func (p *Provider) getBootstrapToken(ctx context.Context) string {
+	// Env var takes priority as an explicit override
+	if envToken := options.FromContext(ctx).KubeletClientTLSBootstrapToken; envToken != "" {
+		return envToken
+	}
+
+	// Read fresh from kube-system secrets
+	if p.kubeClient != nil {
+		secrets, err := p.kubeClient.CoreV1().Secrets("kube-system").List(ctx, metav1.ListOptions{
+			FieldSelector: "type=bootstrap.kubernetes.io/token",
+		})
+		if err == nil && len(secrets.Items) > 0 {
+			secret := secrets.Items[0]
+			tokenID := string(secret.Data["token-id"])
+			tokenSecret := string(secret.Data["token-secret"])
+			if tokenID != "" && tokenSecret != "" {
+				log.FromContext(ctx).V(1).Info("read bootstrap token from kube-system secret", "secret", secret.Name)
+				return fmt.Sprintf("%s.%s", tokenID, tokenSecret)
+			}
+		} else if err != nil {
+			log.FromContext(ctx).Error(err, "failed to read bootstrap token secrets from kube-system")
+		}
+	}
+
+	log.FromContext(ctx).Error(fmt.Errorf("no bootstrap token available"), "set KUBELET_BOOTSTRAP_TOKEN or grant secret read access to kube-system")
+	return ""
 }
 
 // ATTENTION!!!: changes here may NOT be effective on AKS machine nodes (ProvisionModeAKSMachineAPI); See aksmachineinstance.go/aksmachineinstancehelpers.go.

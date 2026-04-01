@@ -174,6 +174,7 @@ func NewRegionalEnvironment(ctx context.Context, env *coretest.Environment, regi
 		ctx,
 		imageFamilyResolver,
 		imageFamilyProvider,
+		env.KubernetesInterface,
 		lo.ToPtr("ca-bundle"),
 		testOptions.ClusterEndpoint,
 		"test-tenant",
