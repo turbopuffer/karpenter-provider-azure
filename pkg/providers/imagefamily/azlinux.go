@@ -79,16 +79,11 @@ func (u AzureLinux) DefaultImages(useSIG bool, fipsMode *v1beta1.FIPSMode) []typ
 			},
 		}
 	}
-	// Use AzureLinux3 for x64 (has NVMe disk controller support in CIG, needed for NVMe-only VMs like L-series v4).
-	// ARM64: AzureLinux3 V3gen2arm64 in the CIG has incorrect x64 metadata (azure/aks#5670), so keep AzureLinux2
-	// on the CIG path. On the SIG path (aksmachineapi) that bug doesn't apply and V2 arm64 images are stale
-	// (fail node-image-age policies), so use AzureLinux3.
-	armImageDef := AzureLinuxGen2ArmImageDefinition
-	armDistro := "aks-azurelinux-v2-arm64-gen2"
-	if useSIG {
-		armImageDef = AzureLinux3Gen2ArmImageDefinition
-		armDistro = "aks-azurelinux-v3-arm64-gen2"
-	}
+	// Use AzureLinux3 for both x64 (has NVMe disk controller support in CIG, needed for NVMe-only VMs like
+	// L-series v4) and ARM64. The CIG V3gen2arm64 metadata bug (azure/aks#5670) that previously forced
+	// AzureLinux2 on the CIG path has since been fixed.
+	armImageDef := AzureLinux3Gen2ArmImageDefinition
+	armDistro := "aks-azurelinux-v3-arm64-gen2"
 	return []types.DefaultImageOutput{
 		{
 			PublicGalleryURL:     AKSAzureLinuxPublicGalleryURL,
