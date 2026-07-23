@@ -346,6 +346,10 @@ az-build: ## Build the Karpenter controller and webhook images using skaffold bu
 	az acr login -n $(AZURE_ACR_NAME)
 	skaffold build
 
+az-build-fips: ## Build the FIPS 140-3 variant of the controller image (controller-fips)
+	az acr login -n $(AZURE_ACR_NAME)
+	skaffold build -p fips
+
 az-creds: ## Get cluster credentials
 	az aks get-credentials --name $(AZURE_CLUSTER_NAME) --resource-group $(AZURE_RESOURCE_GROUP) --overwrite-existing
 
