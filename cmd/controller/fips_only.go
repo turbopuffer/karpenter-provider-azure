@@ -8,4 +8,10 @@
 
 //go:debug fips140=only
 
+// Disable the X25519MLKEM768 hybrid key share: its X25519 component is not
+// FIPS-approved, and Go generates the default key share before fips140=only
+// filtering, so TLS handshakes panic without this. With it off, the client
+// leads with P-256.
+//go:debug tlsmlkem=0
+
 package main
