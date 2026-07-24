@@ -10,6 +10,22 @@ build:
             - '**/*.go'
             - '**/*.gtpl'
             #flags: ['-tags', 'ccp']
+profiles:
+  # FIPS variant: same controller, built with Go's FIPS 140-3 validated crypto
+  # module (GOFIPS140 also bakes in GODEBUG=fips140=on as the runtime default).
+  # Published as a parallel image name, matching the tpuf *-fips convention.
+  - name: fips
+    build:
+      artifacts:
+        - image: controller-fips
+          ko:
+            main: github.com/Azure/karpenter-provider-azure/cmd/controller
+            env:
+              - GOFIPS140=v1.0.0
+            dependencies:
+              paths:
+                - '**/*.go'
+                - '**/*.gtpl'
 manifests:
   helm:
     releases:
