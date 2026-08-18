@@ -43,6 +43,7 @@ const (
 
 	cigImageVersion      = "202505.27.0"
 	laterCIGImageVersion = "202605.27.0"
+	pinnedImageVersion   = "202601.01.0"
 
 	sigImageVersion = "202512.18.0" // Updated to match fake data versions
 )
@@ -169,6 +170,42 @@ var _ = Describe("NodeImageProvider tests", func() {
 			// Explicitly verify ARM64 image is NOT included in CIG (Community Image Gallery)
 			Expect(foundImages).ToNot(ContainElement(HaveField("ID", ContainSubstring("V3gen2arm64"))))
 		})
+
+		It("should use the pinned image version for a pinned family instead of the latest CIG version", func() {
+			nodeClass.Spec.ImageFamily = lo.ToPtr(v1beta1.Ubuntu2204ImageFamily)
+			testOptions.NodeImageVersions = map[string]string{v1beta1.Ubuntu2204ImageFamily: pinnedImageVersion}
+			ctx = options.ToContext(ctx, testOptions)
+
+			foundImages, err := nodeImageProvider.List(ctx, nodeClass)
+			Expect(err).ToNot(HaveOccurred())
+			expectedImages := renderExpectedCIGNodeImages(&imagefamily.Ubuntu2204{}, nodeClass.Spec.FIPSMode, pinnedImageVersion)
+			Expect(foundImages).To(Equal(expectedImages))
+		})
+
+		It("should keep floating to latest for families without a pin entry", func() {
+			nodeClass.Spec.ImageFamily = lo.ToPtr(v1beta1.Ubuntu2204ImageFamily)
+			testOptions.NodeImageVersions = map[string]string{v1beta1.AzureLinuxImageFamily: pinnedImageVersion}
+			ctx = options.ToContext(ctx, testOptions)
+
+			foundImages, err := nodeImageProvider.List(ctx, nodeClass)
+			Expect(err).ToNot(HaveOccurred())
+			expectedImages := renderExpectedCIGNodeImages(&imagefamily.Ubuntu2204{}, nodeClass.Spec.FIPSMode, cigImageVersion)
+			Expect(foundImages).To(Equal(expectedImages))
+		})
+
+		It("should not serve cached latest images once a pin is set", func() {
+			nodeClass.Spec.ImageFamily = lo.ToPtr(v1beta1.Ubuntu2204ImageFamily)
+			foundImages, err := nodeImageProvider.List(ctx, nodeClass)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(foundImages).To(Equal(renderExpectedCIGNodeImages(&imagefamily.Ubuntu2204{}, nodeClass.Spec.FIPSMode, cigImageVersion)))
+
+			testOptions.NodeImageVersions = map[string]string{v1beta1.Ubuntu2204ImageFamily: pinnedImageVersion}
+			ctx = options.ToContext(ctx, testOptions)
+
+			foundImages, err = nodeImageProvider.List(ctx, nodeClass)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(foundImages).To(Equal(renderExpectedCIGNodeImages(&imagefamily.Ubuntu2204{}, nodeClass.Spec.FIPSMode, pinnedImageVersion)))
+		})
 	})
 
 	Context("List SIG Images", func() {
@@ -178,6 +215,25 @@ var _ = Describe("NodeImageProvider tests", func() {
 			testOptions.SIGSubscriptionID = sigSubscription
 			testOptions.SIGAccessTokenServerURL = "http://valid-url.com"
 			ctx = options.ToContext(ctx, testOptions)
+		})
+
+		It("should use the pinned image version instead of the node image versions API", func() {
+			testOptions.NodeImageVersions = map[string]string{v1beta1.Ubuntu2204ImageFamily: pinnedImageVersion}
+			ctx = options.ToContext(ctx, testOptions)
+			nodeClass.Spec.ImageFamily = lo.ToPtr(v1beta1.Ubuntu2204ImageFamily)
+
+			foundImages, err := nodeImageProvider.List(ctx, nodeClass)
+			Expect(err).ToNot(HaveOccurred())
+
+			defaultImages := (&imagefamily.Ubuntu2204{}).DefaultImages(true, nodeClass.Spec.FIPSMode)
+			expectedImages := make([]imagefamily.NodeImage, 0, len(defaultImages))
+			for _, img := range defaultImages {
+				expectedImages = append(expectedImages, imagefamily.NodeImage{
+					ID:           imagefamily.BuildImageIDSIG(sigSubscription, img.GalleryResourceGroup, img.GalleryName, img.ImageDefinition, pinnedImageVersion),
+					Requirements: img.Requirements,
+				})
+			}
+			Expect(foundImages).To(Equal(expectedImages))
 		})
 
 		Context("List FIPS Images When FIPSMode Is Explicitly FIPS", func() {

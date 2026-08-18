@@ -125,6 +125,7 @@ var _ = Describe("Options", func() {
 			os.Setenv("KUBELET_IDENTITY_CLIENT_ID", "12345678-1234-1234-1234-123456789012")
 			os.Setenv("LINUX_ADMIN_USERNAME", "customadminusername")
 			os.Setenv("ADDITIONAL_TAGS", "test-tag=test-value")
+			os.Setenv("NODE_IMAGE_VERSIONS", "AzureLinux=202601.01.0")
 			os.Setenv("AKS_MACHINES_POOL_NAME", "testmpool")
 			os.Setenv("MANAGE_EXISTING_AKS_MACHINES", "true")
 			fs = &coreoptions.FlagSet{
@@ -155,6 +156,7 @@ var _ = Describe("Options", func() {
 				NodeResourceGroup:              lo.ToPtr("my-node-rg"),
 				KubeletIdentityClientID:        lo.ToPtr("12345678-1234-1234-1234-123456789012"),
 				AdditionalTags:                 map[string]string{"test-tag": "test-value"},
+				NodeImageVersions:              map[string]string{"AzureLinux": "202601.01.0"},
 				ClusterDNSServiceIP:            lo.ToPtr("10.244.0.1"),
 				ManageExistingAKSMachines:      lo.ToPtr(true),
 				AKSMachinesPoolName:            lo.ToPtr("testmpool"),

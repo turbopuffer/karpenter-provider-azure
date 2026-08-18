@@ -50,6 +50,7 @@ type OptionsFields struct {
 	ClusterDNSServiceIP            *string
 	ManageExistingAKSMachines      *bool
 	AKSMachinesPoolName            *string
+	NodeImageVersions              map[string]string
 
 	// SIG Flags not required by the self hosted offering
 	UseSIG                  *bool
@@ -92,5 +93,6 @@ func Options(overrides ...OptionsFields) *azoptions.Options {
 		DNSServiceIP:                   lo.FromPtrOr(options.ClusterDNSServiceIP, ""),
 		ManageExistingAKSMachines:      lo.FromPtrOr(options.ManageExistingAKSMachines, false),
 		AKSMachinesPoolName:            lo.FromPtrOr(options.AKSMachinesPoolName, "aksmanagedap"),
+		NodeImageVersions:              options.NodeImageVersions,
 	}
 }

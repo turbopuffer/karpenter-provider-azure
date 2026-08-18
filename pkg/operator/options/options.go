@@ -93,6 +93,7 @@ type Options struct {
 	AdditionalTags             map[string]string `json:"additionalTags,omitempty"`
 	EnableAzureSDKLogging      bool              `json:"enableAzureSDKLogging,omitempty"` // Controls whether Azure SDK middleware logging is enabled
 	DiskEncryptionSetID        string            `json:"diskEncryptionSetId,omitempty"`
+	NodeImageVersions          map[string]string `json:"nodeImageVersions,omitempty"` // Per-image-family node image version pins, keyed by AKSNodeClass imageFamily; families without an entry float to the latest published version
 
 	// If set to true, existing AKS machines created with PROVISION_MODE=aksmachineapi will be managed even with other provision modes. This option does not have any effect if PROVISION_MODE=aksmachineapi, as it will behave as if this option is set to true.
 	ManageExistingAKSMachines bool `json:"manageExistingAKSMachines,omitempty"`
@@ -126,6 +127,11 @@ func (o *Options) AddFlags(fs *coreoptions.FlagSet) {
 	fs.StringVar(&o.SIGAccessTokenServerURL, "sig-access-token-server-url", env.WithDefaultString("SIG_ACCESS_TOKEN_SERVER_URL", ""), "The URL for the SIG access token server. Only used for AKS managed karpenter. UseSIG must be set tot true for this to take effect.")
 	fs.StringVar(&o.SIGSubscriptionID, "sig-subscription-id", env.WithDefaultString("SIG_SUBSCRIPTION_ID", ""), "The subscription ID of the shared image gallery.")
 	fs.StringVar(&o.DiskEncryptionSetID, "node-osdisk-diskencryptionset-id", env.WithDefaultString("NODE_OSDISK_DISKENCRYPTIONSET_ID", ""), "The ARM resource ID of the disk encryption set to use for customer-managed key (BYOK) encryption.")
+	nodeImageVersionsFlag := k8sflag.NewMapStringString(&o.NodeImageVersions)
+	if err := nodeImageVersionsFlag.Set(env.WithDefaultString("NODE_IMAGE_VERSIONS", "")); err != nil {
+		panic(fmt.Sprintf("failed to parse NODE_IMAGE_VERSIONS from string %q: %s", env.WithDefaultString("NODE_IMAGE_VERSIONS", ""), err))
+	}
+	fs.Var(nodeImageVersionsFlag, "node-image-versions", "Per-image-family node image version pins, keyed by AKSNodeClass imageFamily. Format is AzureLinux=202605.27.0,Ubuntu2204=202601.01.0. A pinned family resolves images at that gallery version and drift converges its nodes to it; families without an entry float to the latest published version.")
 	fs.BoolVar(&o.ManageExistingAKSMachines, "manage-existing-aks-machines", env.WithDefaultBool("MANAGE_EXISTING_AKS_MACHINES", false), "If set to true, existing AKS machines created with PROVISION_MODE=aksmachineapi will be managed even with other provision modes. This option does not have any effect if PROVISION_MODE=aksmachineapi, as it will behave as if this option is set to true.")
 	fs.StringVar(&o.AKSMachinesPoolName, "aks-machines-pool-name", env.WithDefaultString("AKS_MACHINES_POOL_NAME", ""), "The name of the agent pool that the AKS machines are/will be in with PROVISION_MODE=aksmachineapi. Existing AKS machines outside of this pool will be ignored. Required when PROVISION_MODE=aksmachineapi.")
 

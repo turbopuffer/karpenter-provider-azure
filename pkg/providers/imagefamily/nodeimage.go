@@ -90,10 +90,12 @@ func (p *provider) List(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) ([
 	}
 
 	supportedImages := getSupportedImages(nodeClass.Spec.ImageFamily, nodeClass.Spec.FIPSMode, kubernetesVersion, useSIG)
+	pin := pinnedImageVersion(ctx, nodeClass.Spec.ImageFamily)
 
 	key, err := p.cacheKey(
 		supportedImages,
 		kubernetesVersion,
+		pin,
 	)
 	if err != nil {
 		return []NodeImage{}, err
@@ -106,12 +108,12 @@ func (p *provider) List(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) ([
 	var nodeImages []NodeImage
 	if useSIG {
 		log.FromContext(ctx).V(1).Info("using SIG to list node images")
-		nodeImages, err = p.listSIG(ctx, supportedImages)
+		nodeImages, err = p.listSIG(ctx, supportedImages, pin)
 		if err != nil {
 			return []NodeImage{}, err
 		}
 	} else {
-		nodeImages, err = p.listCIG(ctx, supportedImages)
+		nodeImages, err = p.listCIG(supportedImages, pin)
 		if err != nil {
 			return []NodeImage{}, err
 		}
@@ -121,8 +123,25 @@ func (p *provider) List(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) ([
 	return nodeImages, nil
 }
 
-func (p *provider) listSIG(ctx context.Context, supportedImages []types.DefaultImageOutput) ([]NodeImage, error) {
+// pinnedImageVersion resolves the image version pin for a node class's image
+// family. Empty means float to the latest published version.
+func pinnedImageVersion(ctx context.Context, imageFamily *string) string {
+	return options.FromContext(ctx).NodeImageVersions[lo.FromPtr(imageFamily)]
+}
+
+func (p *provider) listSIG(ctx context.Context, supportedImages []types.DefaultImageOutput, pin string) ([]NodeImage, error) {
 	nodeImages := []NodeImage{}
+
+	if pin != "" {
+		for _, supportedImage := range supportedImages {
+			nodeImages = append(nodeImages, NodeImage{
+				ID:           BuildImageIDSIG(options.FromContext(ctx).SIGSubscriptionID, supportedImage.GalleryResourceGroup, supportedImage.GalleryName, supportedImage.ImageDefinition, pin),
+				Requirements: supportedImage.Requirements,
+			})
+		}
+		return nodeImages, nil
+	}
+
 	retrievedLatestImages, err := p.nodeImageVersions.List(ctx, p.location)
 	if err != nil {
 		return nil, err
@@ -150,12 +169,18 @@ func (p *provider) listSIG(ctx context.Context, supportedImages []types.DefaultI
 	return nodeImages, nil
 }
 
-func (p *provider) listCIG(_ context.Context, supportedImages []types.DefaultImageOutput) ([]NodeImage, error) {
+func (p *provider) listCIG(supportedImages []types.DefaultImageOutput, pin string) ([]NodeImage, error) {
 	nodeImages := []NodeImage{}
 	for _, supportedImage := range supportedImages {
-		cigImageID, err := p.getCIGImageID(supportedImage.PublicGalleryURL, supportedImage.ImageDefinition)
-		if err != nil {
-			return nil, err
+		var cigImageID string
+		if pin != "" {
+			cigImageID = BuildImageIDCIG(supportedImage.PublicGalleryURL, supportedImage.ImageDefinition, pin)
+		} else {
+			var err error
+			cigImageID, err = p.getCIGImageID(supportedImage.PublicGalleryURL, supportedImage.ImageDefinition)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		nodeImages = append(nodeImages, NodeImage{
@@ -166,12 +191,13 @@ func (p *provider) listCIG(_ context.Context, supportedImages []types.DefaultIma
 	return nodeImages, nil
 }
 
-func (p *provider) cacheKey(supportedImages []types.DefaultImageOutput, k8sVersion string) (string, error) {
+func (p *provider) cacheKey(supportedImages []types.DefaultImageOutput, k8sVersion string, imageVersionPin string) (string, error) {
 	// Note: the kubernetes version is part of the cache key here, because we bump images on kubernetes upgrade meaning
 	// we want to ensure if there is a kubernetes change we'll get fresh images if there are any.
 	hash, err := hashstructure.Hash([]interface{}{
 		supportedImages,
 		k8sVersion,
+		imageVersionPin,
 	}, hashstructure.FormatV2, &hashstructure.HashOptions{SlicesAsSets: true})
 	if err != nil {
 		return "", err
