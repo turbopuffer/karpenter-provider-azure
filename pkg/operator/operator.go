@@ -141,15 +141,12 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 	inClusterConfig.UserAgent = auth.GetUserAgentExtension()
 	inClusterClient := kubernetes.NewForConfigOrDie(inClusterConfig)
 
+	// A wrong DNSServiceIP breaks DNS on every node this controller creates.
 	if options.FromContext(ctx).DNSServiceIP == "" {
-		kubeDNSIP, err := kubeDNSIP(ctx, operator.KubernetesInterface)
-		if err != nil { // fall back to default
-			log.FromContext(ctx).V(1).Info("unable to detect the IP of the kube-dns service, using default 10.0.0.10", "error", err)
-			options.FromContext(ctx).DNSServiceIP = "10.0.0.10"
-		} else {
-			log.FromContext(ctx).V(1).Info("discovered DNS service IP", "dns-service-ip", kubeDNSIP.String())
-			options.FromContext(ctx).DNSServiceIP = kubeDNSIP.String()
-		}
+		discoveredDNSIP, err := kubeDNSIP(ctx, operator.KubernetesInterface)
+		lo.Must0(err, "detecting the IP of the kube-dns service; set DNS_SERVICE_IP to skip discovery")
+		log.FromContext(ctx).Info("discovered DNS service IP", "dns-service-ip", discoveredDNSIP.String())
+		options.FromContext(ctx).DNSServiceIP = discoveredDNSIP.String()
 	}
 
 	unavailableOfferingsCache := azurecache.NewUnavailableOfferings()
