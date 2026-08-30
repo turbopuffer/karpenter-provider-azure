@@ -18,5 +18,5 @@ for v in $VARIANTS; do
   src="docker://$ACR/$v:$TAG"
   dst="docker://$GAR/karpenter-azure-$v:$TAG"
   skopeo copy --all --preserve-digests "$src" "$dst"
-  echo "$dst@$(skopeo inspect "$dst" | jq -r .Digest)"
+  echo "$dst@sha256:$(skopeo inspect --raw "$dst" | shasum -a 256 | cut -d' ' -f1)"
 done
