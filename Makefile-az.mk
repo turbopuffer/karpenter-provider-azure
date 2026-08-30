@@ -350,6 +350,18 @@ az-build-fips: ## Build the FIPS 140-3 variant of the controller image (controll
 	az acr login -n $(AZURE_ACR_NAME)
 	skaffold build -p fips
 
+TPUF_ACR_REPO ?= turbopuffer.azurecr.io/turbopuffer/karpenter-azure
+TPUF_TAG ?= $(shell git describe --tags)
+
+az-release: ## Build controller + controller-fips for the current commit, push to turbopuffer ACR, mirror to GAR, print the pins
+	az acr login -n turbopuffer
+	skaffold build --default-repo $(TPUF_ACR_REPO) --tag $(TPUF_TAG)
+	skaffold build -p fips --default-repo $(TPUF_ACR_REPO) --tag $(TPUF_TAG)
+	hack/mirror-gar.sh $(TPUF_TAG)
+
+az-mirror-gar: ## Copy already-built controller images for a tag from turbopuffer ACR to GAR (TAG=... to override, default: current commit)
+	hack/mirror-gar.sh $(TAG)
+
 az-creds: ## Get cluster credentials
 	az aks get-credentials --name $(AZURE_CLUSTER_NAME) --resource-group $(AZURE_RESOURCE_GROUP) --overwrite-existing
 
