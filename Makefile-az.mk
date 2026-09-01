@@ -353,7 +353,6 @@ az-build-fips: ## Build the FIPS 140-3 variant of the controller image (controll
 TPUF_ACR_REPO ?= turbopuffer.azurecr.io/turbopuffer/karpenter-azure
 TPUF_TAG ?= $(shell git describe --tags)
 
-# CI entrypoint: ACR auth is assumed (e.g. docker/login-action); GAR via gcloud.
 az-release-ci: ## Build controller + controller-fips, push to ACR, mirror to GAR (no az acr login)
 	skaffold build --default-repo $(TPUF_ACR_REPO) --tag $(TPUF_TAG)
 	skaffold build -p fips --default-repo $(TPUF_ACR_REPO) --tag $(TPUF_TAG)

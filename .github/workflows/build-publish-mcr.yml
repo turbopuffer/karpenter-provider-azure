@@ -1,6 +1,4 @@
-# Upstream Azure workflow that publishes to MCR via a 1ES self-hosted pool.
-# Disabled on this fork — image publishing is handled by upload-images.yml
-# (turbopuffer ACR + Google Artifact Registry).
+# Disabled on this fork — see upload-images.yml.
 
 name: Build and publish to MCR
 on:
