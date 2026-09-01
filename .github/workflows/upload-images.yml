@@ -67,7 +67,6 @@ jobs:
             tag="$(git describe --tags)"
           fi
           echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
-          echo "Publishing images as :${tag}"
 
       - name: Release
         run: make az-release-ci TPUF_TAG="${{ steps.tag.outputs.tag }}"
