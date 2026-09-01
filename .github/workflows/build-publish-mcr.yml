@@ -1,22 +1,15 @@
-# This Github action builds and publishes image to Azure Container Registry (ACR),
-# from where it is automatically propagated to Microsoft Container Registry (MCR).
+# Disabled on this fork — see upload-images.yml.
 
 name: Build and publish to MCR
 on:
-  push:
-    # Only release on supported semantic version tagging e.g. v0.0.1-rc.0
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
-      - 'v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+'
-      - 'v[0-9]+.[0-9]+.[0-9]+-alpha.[0-9]+'
-      - 'v[0-9]+.[0-9]+.[0-9]+-beta.[0-9]+'
-      - 'v[0-9]+.[0-9]+.[0-9]+-test.[a-z0-9]+'
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   publish-images:
+    if: false
     permissions:
       contents: read
       id-token: write # This is required for requesting the JWT
