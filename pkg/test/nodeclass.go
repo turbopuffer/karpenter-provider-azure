@@ -24,7 +24,6 @@ import (
 	"dario.cat/mergo"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily"
-	imagefamilytypes "github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily/types"
 	opstatus "github.com/awslabs/operatorpkg/status"
 	"github.com/blang/semver/v4"
 	"github.com/samber/lo"
@@ -77,6 +76,7 @@ func ApplyDefaultStatus(nodeClass *v1beta1.AKSNodeClass, env *coretest.Environme
 	nodeClass.StatusConditions().SetTrue(opstatus.ConditionReady)
 	nodeClass.StatusConditions().SetTrue(v1beta1.ConditionTypeSubnetsReady)
 	nodeClass.StatusConditions().SetTrue(v1beta1.ConditionTypeValidationSucceeded)
+	nodeClass.StatusConditions().SetTrue(v1beta1.ConditionTypeLocalDNSReady)
 
 	conditions := []opstatus.Condition{}
 	for _, condition := range nodeClass.GetConditions() {
@@ -151,22 +151,12 @@ func ApplySIGImagesWithVersion(nodeClass *v1beta1.AKSNodeClass, sigImageVersion 
 	if nodeClass.Status.KubernetesVersion != nil {
 		kubernetesVersion = *nodeClass.Status.KubernetesVersion
 	}
-	imageFamilyNodeImages := getExpectedTestSIGImages(*nodeClass.Spec.ImageFamily, nodeClass.Spec.FIPSMode, sigImageVersion, kubernetesVersion)
+	imageFamilyNodeImages := getExpectedTestSIGImages(*nodeClass.Spec.ImageFamily, nodeClass.Spec.FIPSMode, nodeClass.IsTrustedLaunchEnabled(), sigImageVersion, kubernetesVersion)
 	nodeClass.Status.Images = translateToStatusNodeImages(imageFamilyNodeImages)
 }
 
-func getExpectedTestSIGImages(imageFamily string, fipsMode *v1beta1.FIPSMode, version string, kubernetesVersion string) []imagefamily.NodeImage {
-	var images []imagefamilytypes.DefaultImageOutput
-	switch imageFamily {
-	case v1beta1.Ubuntu2204ImageFamily:
-		images = imagefamily.Ubuntu2204{}.DefaultImages(true, fipsMode)
-	case v1beta1.AzureLinuxImageFamily:
-		if imagefamily.UseAzureLinux3(kubernetesVersion) {
-			images = imagefamily.AzureLinux3{}.DefaultImages(true, fipsMode)
-		} else {
-			images = imagefamily.AzureLinux{}.DefaultImages(true, fipsMode)
-		}
-	}
+func getExpectedTestSIGImages(imageFamily string, fipsMode *v1beta1.FIPSMode, trustedLaunch bool, version string, kubernetesVersion string) []imagefamily.NodeImage {
+	images := imagefamily.GetImageFamily(&imageFamily, fipsMode, trustedLaunch, kubernetesVersion, nil).DefaultImages(true, fipsMode, trustedLaunch)
 	nodeImages := []imagefamily.NodeImage{}
 	for _, image := range images {
 		nodeImages = append(nodeImages, imagefamily.NodeImage{
@@ -180,7 +170,7 @@ func getExpectedTestSIGImages(imageFamily string, fipsMode *v1beta1.FIPSMode, ve
 func translateToStatusNodeImages(imageFamilyNodeImages []imagefamily.NodeImage) []v1beta1.NodeImage {
 	return lo.Map(imageFamilyNodeImages, func(nodeImage imagefamily.NodeImage, _ int) v1beta1.NodeImage {
 		reqs := lo.Map(nodeImage.Requirements.NodeSelectorRequirements(), func(item karpv1.NodeSelectorRequirementWithMinValues, _ int) corev1.NodeSelectorRequirement {
-			return item.NodeSelectorRequirement
+			return corev1.NodeSelectorRequirement{Key: item.Key, Operator: item.Operator, Values: item.Values}
 		})
 
 		// sorted for consistency

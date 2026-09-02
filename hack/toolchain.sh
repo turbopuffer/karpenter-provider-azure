@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-K8S_VERSION="${K8S_VERSION:="1.29.x"}"
+K8S_VERSION="${K8S_VERSION:="1.34.x"}"
 KUBEBUILDER_ASSETS="/usr/local/kubebuilder/bin"
 
 # Default SKIP_INSTALLED to false if not set
@@ -63,7 +63,7 @@ crosscompilers() {
 }
 
 tools() {
-    go-install go-licenses github.com/google/go-licenses@v1.6.0
+    go-install go-licenses github.com/google/go-licenses/v2@3e084b0caf710f7bfead967567539214f598c0a2 // v2.0.1
     go-install ko github.com/google/ko@v0.17.1
     go-install yq github.com/mikefarah/yq/v4@v4.45.1
     go-install helm-docs github.com/norwoodj/helm-docs/cmd/helm-docs@v1.14.2
@@ -83,7 +83,7 @@ tools() {
         echo "Go workspace's \"bin\" directory is not in PATH. Run 'export PATH=\"\$PATH:\${GOPATH:-\$HOME/go}/bin\"'."
     fi
 
-    go-install golangci-lint github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.8.0
+    go-install golangci-lint github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
 
     # Install our custom modules in golangci-lint
     if ! should-skip "golangci-lint-custom"; then

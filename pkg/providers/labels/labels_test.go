@@ -60,12 +60,13 @@ func TestGetAllSingleValuedRequirementLabels(t *testing.T) {
 				scheduling.NewRequirement(corev1.LabelInstanceTypeStable, corev1.NodeSelectorOpIn, "Standard_D2s_v3"),
 				scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand, karpv1.CapacityTypeSpot),
 				scheduling.NewRequirement(v1beta1.AKSLabelScaleSetPriority, corev1.NodeSelectorOpIn, v1beta1.ScaleSetPriorityRegular, v1beta1.ScaleSetPrioritySpot),
+				scheduling.NewRequirement(v1beta1.AKSLabelPriority, corev1.NodeSelectorOpIn, v1beta1.PriorityRegular, v1beta1.PrioritySpot),
 				scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "westus-1"),
 			),
 			expectedLabels: map[string]string{
 				corev1.LabelInstanceTypeStable: "Standard_D2s_v3",
 				corev1.LabelTopologyZone:       "westus-1",
-				// karpv1.CapacityTypeLabelKey and v1beta1.AKSLabelScaleSetPriority should be excluded because they have multiple values
+				// karpv1.CapacityTypeLabelKey, v1beta1.AKSLabelScaleSetPriority, and v1beta1.AKSLabelPriority should be excluded because they have multiple values
 			},
 		},
 		{
@@ -73,6 +74,7 @@ func TestGetAllSingleValuedRequirementLabels(t *testing.T) {
 			requirements: scheduling.NewRequirements(
 				scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand, karpv1.CapacityTypeSpot),
 				scheduling.NewRequirement(v1beta1.AKSLabelScaleSetPriority, corev1.NodeSelectorOpIn, v1beta1.ScaleSetPriorityRegular, v1beta1.ScaleSetPrioritySpot),
+				scheduling.NewRequirement(v1beta1.AKSLabelPriority, corev1.NodeSelectorOpIn, v1beta1.PriorityRegular, v1beta1.PrioritySpot),
 				scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "westus-1", "westus-2"),
 			),
 			expectedLabels: map[string]string{},
@@ -248,6 +250,7 @@ func TestLocalDNSLabels(t *testing.T) {
 	testCases := []struct {
 		name              string
 		localDNS          *v1beta1.LocalDNS
+		localDNSState     *v1beta1.LocalDNSState
 		kubernetesVersion string
 		expectedLabel     string
 	}{
@@ -256,6 +259,7 @@ func TestLocalDNSLabels(t *testing.T) {
 			localDNS: &v1beta1.LocalDNS{
 				Mode: v1beta1.LocalDNSModeRequired,
 			},
+			localDNSState:     lo.ToPtr(v1beta1.LocalDNSStateEnabled),
 			kubernetesVersion: "1.35.0",
 			expectedLabel:     "enabled",
 		},
@@ -264,30 +268,34 @@ func TestLocalDNSLabels(t *testing.T) {
 			localDNS: &v1beta1.LocalDNS{
 				Mode: v1beta1.LocalDNSModeDisabled,
 			},
+			localDNSState:     lo.ToPtr(v1beta1.LocalDNSStateDisabled),
 			kubernetesVersion: "1.35.0",
 			expectedLabel:     "disabled",
 		},
 		{
-			name: "LocalDNS mode is Preferred with k8s >= 1.35",
+			name: "LocalDNS mode is Preferred with k8s 1.35 (below threshold)",
 			localDNS: &v1beta1.LocalDNS{
 				Mode: v1beta1.LocalDNSModePreferred,
 			},
+			localDNSState:     lo.ToPtr(v1beta1.LocalDNSStateDisabled),
 			kubernetesVersion: "1.35.0",
-			expectedLabel:     "enabled",
+			expectedLabel:     "disabled",
 		},
 		{
 			name: "LocalDNS mode is Preferred with k8s 1.36",
 			localDNS: &v1beta1.LocalDNS{
 				Mode: v1beta1.LocalDNSModePreferred,
 			},
+			localDNSState:     lo.ToPtr(v1beta1.LocalDNSStateEnabled),
 			kubernetesVersion: "1.36.0",
 			expectedLabel:     "enabled",
 		},
 		{
-			name: "LocalDNS mode is Preferred with k8s < 1.35",
+			name: "LocalDNS mode is Preferred with k8s < 1.36",
 			localDNS: &v1beta1.LocalDNS{
 				Mode: v1beta1.LocalDNSModePreferred,
 			},
+			localDNSState:     lo.ToPtr(v1beta1.LocalDNSStateDisabled),
 			kubernetesVersion: "1.34.0",
 			expectedLabel:     "disabled",
 		},
@@ -296,6 +304,7 @@ func TestLocalDNSLabels(t *testing.T) {
 			localDNS: &v1beta1.LocalDNS{
 				Mode: v1beta1.LocalDNSModePreferred,
 			},
+			localDNSState:     lo.ToPtr(v1beta1.LocalDNSStateDisabled),
 			kubernetesVersion: "1.34.9",
 			expectedLabel:     "disabled",
 		},
@@ -340,6 +349,9 @@ func TestLocalDNSLabels(t *testing.T) {
 						},
 					},
 				},
+			}
+			if tc.localDNSState != nil {
+				nodeClass.Status.LocalDNSState = tc.localDNSState
 			}
 
 			labelMap, err := labels.Get(ctx, nodeClass, "amd64")
@@ -477,13 +489,11 @@ func TestLabelsGet(t *testing.T) {
 		},
 		// Artifact streaming label cases
 		{
-			name:              "AMD64 with nil artifact streaming (default) should have label set to true",
+			name:              "AMD64 with nil artifact streaming (default) should NOT have label",
 			imageFamily:       v1beta1.UbuntuImageFamily,
 			kubernetesVersion: "1.35.0",
 			arch:              "amd64",
-			expectedLabels: map[string]string{
-				labels.AKSArtifactStreamingEnabledLabelKey: "true",
-			},
+			unexpectedLabels:  []string{labels.AKSArtifactStreamingEnabledLabelKey},
 		},
 		{
 			name:              "ARM64 with nil artifact streaming (default) should NOT have label",

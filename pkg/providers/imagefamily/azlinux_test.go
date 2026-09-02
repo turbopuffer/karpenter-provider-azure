@@ -66,6 +66,9 @@ func TestAzureLinux_CustomScriptsNodeBootstrapping(t *testing.T) {
 	var fipsMode *v1beta1.FIPSMode                   // to test with nil
 	var localDNS *v1beta1.LocalDNS                   // to test with nil
 	var artifactStreaming *v1beta1.ArtifactStreaming // to test with nil
+	var linuxOSConfig *v1beta1.LinuxOSConfiguration  // to test with nil
+	var vTPMEnabled *bool                            // to test with nil
+	var secureBootEnabled *bool                      // to test with nil
 
 	bootstrapper := azureLinux.CustomScriptsNodeBootstrapping(
 		kubeletConfig,
@@ -79,6 +82,9 @@ func TestAzureLinux_CustomScriptsNodeBootstrapping(t *testing.T) {
 		fipsMode,
 		localDNS,
 		artifactStreaming,
+		linuxOSConfig,
+		vTPMEnabled,
+		secureBootEnabled,
 	)
 
 	g := NewWithT(t)
@@ -107,6 +113,9 @@ func TestAzureLinux_CustomScriptsNodeBootstrapping(t *testing.T) {
 	g.Expect(provisionBootstrapper.OSSKU).To(Equal(customscriptsbootstrap.ImageFamilyOSSKUAzureLinux2), "ImageFamily field must be set to prevent unsupported image family errors")
 	g.Expect(provisionBootstrapper.FIPSMode).To(BeNil(), "FIPSMode should be nil when not specified")
 	g.Expect(provisionBootstrapper.LocalDNSProfile).To(BeNil(), "LocalDNSProfile should be nil when not specified")
+	g.Expect(provisionBootstrapper.LinuxOSConfig).To(BeNil(), "LinuxOSConfig should be nil when not specified")
+	g.Expect(provisionBootstrapper.VTPMEnabled).To(BeNil())
+	g.Expect(provisionBootstrapper.SecureBootEnabled).To(BeNil())
 }
 
 func TestAzureLinux_Name(t *testing.T) {

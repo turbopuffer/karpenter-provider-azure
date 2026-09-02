@@ -47,7 +47,7 @@ func TestGetCustomDataAndCSE(t *testing.T) {
 	}{
 		{
 			name: "Success with valid parameters",
-			bootstrapper: &customscriptsbootstrap.ProvisionClientBootstrap{
+			bootstrapper: &customscriptsbootstrap.ProvisionClientBootstrap{ //nolint:gosec // G101: fake bootstrap token in test fixture
 				ClusterName:                    "test-cluster",
 				KubeletConfig:                  &bootstrap.KubeletConfiguration{MaxPods: int32(110)},
 				SubnetID:                       "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/virtualNetworks/vnet/subnets/subnet",
@@ -74,7 +74,7 @@ func TestGetCustomDataAndCSE(t *testing.T) {
 		},
 		{
 			name: "Error with nil NodeBootstrapping provider",
-			bootstrapper: &customscriptsbootstrap.ProvisionClientBootstrap{
+			bootstrapper: &customscriptsbootstrap.ProvisionClientBootstrap{ //nolint:gosec // G101: fake bootstrap token in test fixture
 				ClusterName:                    "test-cluster",
 				KubeletConfig:                  &bootstrap.KubeletConfiguration{MaxPods: int32(110)},
 				SubnetID:                       "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/virtualNetworks/vnet/subnets/subnet",
@@ -101,7 +101,7 @@ func TestGetCustomDataAndCSE(t *testing.T) {
 		},
 		{
 			name: "Error with Windows OS",
-			bootstrapper: &customscriptsbootstrap.ProvisionClientBootstrap{
+			bootstrapper: &customscriptsbootstrap.ProvisionClientBootstrap{ //nolint:gosec // G101: fake bootstrap token in test fixture
 				ClusterName:                    "test-cluster",
 				KubeletConfig:                  &bootstrap.KubeletConfiguration{MaxPods: int32(110)},
 				SubnetID:                       "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/virtualNetworks/vnet/subnets/subnet",
@@ -127,7 +127,7 @@ func TestGetCustomDataAndCSE(t *testing.T) {
 		},
 		{
 			name: "NodeBootstrapping returns error",
-			bootstrapper: &customscriptsbootstrap.ProvisionClientBootstrap{
+			bootstrapper: &customscriptsbootstrap.ProvisionClientBootstrap{ //nolint:gosec // G101: fake bootstrap token in test fixture
 				ClusterName:                    "test-cluster",
 				KubeletConfig:                  &bootstrap.KubeletConfiguration{MaxPods: int32(110)},
 				SubnetID:                       "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/virtualNetworks/vnet/subnets/subnet",
@@ -337,8 +337,8 @@ func TestConstructProvisionValues(t *testing.T) {
 				// Check system mode
 				g.Expect(*profile.Mode).To(Equal(models.AgentPoolModeSystem))
 
-				// Check artifact streaming defaults to enabled (nil ArtifactStreaming)
-				g.Expect(*profile.ArtifactStreamingProfile.Enabled).To(BeTrue())
+				// Check artifact streaming defaults to disabled for AzureLinux (nil ArtifactStreaming)
+				g.Expect(*profile.ArtifactStreamingProfile.Enabled).To(BeFalse())
 
 				// Check FIPS enablement (unset/nil FIPSMode is effectively false for now)
 				g.Expect(*profile.EnableFIPS).To(BeFalse())
@@ -378,8 +378,8 @@ func TestConstructProvisionValues(t *testing.T) {
 				g.Expect(*profile.Distro).To(Equal("aks-azurelinux-v3-gen2"))
 				g.Expect(*profile.Mode).To(Equal(models.AgentPoolModeUser))
 
-				// Check artifact streaming defaults to enabled (nil ArtifactStreaming)
-				g.Expect(*profile.ArtifactStreamingProfile.Enabled).To(BeTrue())
+				// Check artifact streaming defaults to disabled for AzureLinux (nil ArtifactStreaming)
+				g.Expect(*profile.ArtifactStreamingProfile.Enabled).To(BeFalse())
 
 				// Check FIPS enablement (unset/nil FIPSMode is effectively false for now)
 				g.Expect(*profile.EnableFIPS).To(BeFalse())
@@ -412,17 +412,18 @@ func TestConstructProvisionValues(t *testing.T) {
 		{
 			name: "GPU instance type",
 			bootstrapper: &customscriptsbootstrap.ProvisionClientBootstrap{
-				ClusterName:               "test-cluster",
-				KubeletConfig:             &bootstrap.KubeletConfiguration{MaxPods: int32(110)},
-				SubnetID:                  "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/virtualNetworks/vnet/subnets/subnet",
-				Arch:                      karpv1.ArchitectureAmd64,
-				ResourceGroup:             "test-rg",
-				KubernetesVersion:         "1.31.0",
-				ImageDistro:               "aks-ubuntu-containerd-22.04-gen2",
-				IsWindows:                 false,
-				StorageProfile:            consts.StorageProfileManagedDisks,
-				OSSKU:                     customscriptsbootstrap.ImageFamilyOSSKUUbuntu2204,
-				NodeBootstrappingProvider: &fake.NodeBootstrappingAPI{},
+				ClusterName:                  "test-cluster",
+				KubeletConfig:                &bootstrap.KubeletConfiguration{MaxPods: int32(110)},
+				SubnetID:                     "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/virtualNetworks/vnet/subnets/subnet",
+				Arch:                         karpv1.ArchitectureAmd64,
+				ResourceGroup:                "test-rg",
+				KubernetesVersion:            "1.31.0",
+				ImageDistro:                  "aks-ubuntu-containerd-22.04-gen2",
+				IsWindows:                    false,
+				StorageProfile:               consts.StorageProfileManagedDisks,
+				OSSKU:                        customscriptsbootstrap.ImageFamilyOSSKUUbuntu2204,
+				NodeBootstrappingProvider:    &fake.NodeBootstrappingAPI{},
+				GPUDriverInstallationEnabled: true,
 				InstanceType: &cloudprovider.InstanceType{
 					Name: "Standard_NC6s_v3", // GPU instance
 					Capacity: v1.ResourceList{
@@ -437,6 +438,38 @@ func TestConstructProvisionValues(t *testing.T) {
 				g := NewWithT(t)
 				g.Expect(values.ProvisionProfile.GpuProfile).ToNot(BeNil())
 				g.Expect(*values.ProvisionProfile.GpuProfile.InstallGPUDriver).To(BeTrue())
+				g.Expect(*values.ProvisionProfile.GpuProfile.DriverType).To(Equal(models.DriverTypeCUDA))
+			},
+		},
+		{
+			name: "GPU instance type with driver installation disabled",
+			bootstrapper: &customscriptsbootstrap.ProvisionClientBootstrap{
+				ClusterName:                  "test-cluster",
+				KubeletConfig:                &bootstrap.KubeletConfiguration{MaxPods: int32(110)},
+				SubnetID:                     "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/virtualNetworks/vnet/subnets/subnet",
+				Arch:                         karpv1.ArchitectureAmd64,
+				ResourceGroup:                "test-rg",
+				KubernetesVersion:            "1.31.0",
+				ImageDistro:                  "aks-ubuntu-containerd-22.04-gen2",
+				IsWindows:                    false,
+				StorageProfile:               consts.StorageProfileManagedDisks,
+				OSSKU:                        customscriptsbootstrap.ImageFamilyOSSKUUbuntu2204,
+				NodeBootstrappingProvider:    &fake.NodeBootstrappingAPI{},
+				GPUDriverInstallationEnabled: false,
+				InstanceType: &cloudprovider.InstanceType{
+					Name: "Standard_NC6s_v3", // GPU instance
+					Capacity: v1.ResourceList{
+						v1.ResourceCPU:    resource.MustParse("6"),
+						v1.ResourceMemory: resource.MustParse("112Gi"),
+						"nvidia.com/gpu":  resource.MustParse("1"),
+					},
+				},
+			},
+			expectError: false,
+			validate: func(t *testing.T, values *models.ProvisionValues) {
+				g := NewWithT(t)
+				g.Expect(values.ProvisionProfile.GpuProfile).ToNot(BeNil())
+				g.Expect(*values.ProvisionProfile.GpuProfile.InstallGPUDriver).To(BeFalse())
 				g.Expect(*values.ProvisionProfile.GpuProfile.DriverType).To(Equal(models.DriverTypeCUDA))
 			},
 		},
@@ -586,6 +619,7 @@ func TestConstructProvisionValues(t *testing.T) {
 						ContainerLogMaxFiles:        lo.ToPtr(int32(10)),
 						PodPidsLimit:                lo.ToPtr(int64(1024)),
 						AllowedUnsafeSysctls:        []string{"kernel.msg*", "net.ipv4.route.min_pmtu"},
+						FailSwapOn:                  lo.ToPtr(false),
 					},
 				},
 				SubnetID:                  "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/virtualNetworks/vnet/subnets/subnet",
@@ -634,6 +668,10 @@ func TestConstructProvisionValues(t *testing.T) {
 				g.Expect(values.ProvisionProfile.CustomKubeletConfig.AllowedUnsafeSysctls).To(HaveLen(2))
 				g.Expect(values.ProvisionProfile.CustomKubeletConfig.AllowedUnsafeSysctls).To(ContainElement("kernel.msg*"))
 				g.Expect(values.ProvisionProfile.CustomKubeletConfig.AllowedUnsafeSysctls).To(ContainElement("net.ipv4.route.min_pmtu"))
+
+				// FailSwapOn
+				g.Expect(values.ProvisionProfile.CustomKubeletConfig.FailSwapOn).ToNot(BeNil())
+				g.Expect(*values.ProvisionProfile.CustomKubeletConfig.FailSwapOn).To(BeFalse())
 			},
 		},
 	}
@@ -667,7 +705,7 @@ func TestConstructProvisionValues(t *testing.T) {
 }
 
 func TestArtifactStreamingEnablement(t *testing.T) {
-	baseBootstrapper := &customscriptsbootstrap.ProvisionClientBootstrap{
+	baseBootstrapper := &customscriptsbootstrap.ProvisionClientBootstrap{ //nolint:gosec // G101: fake bootstrap token in test fixture
 		ClusterName:                    "test-cluster",
 		KubeletConfig:                  &bootstrap.KubeletConfiguration{MaxPods: int32(110)},
 		SubnetID:                       "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/virtualNetworks/vnet/subnets/subnet",
@@ -698,69 +736,21 @@ func TestArtifactStreamingEnablement(t *testing.T) {
 		expectError                      bool
 		expectedErrorSubstring           string
 	}{
-		// Default behavior (artifactStreaming = nil)
+		// Default behavior (artifactStreaming = nil) — disabled for all
 		{
-			name:                             "AMD64 Ubuntu2004 FIPS - Artifact streaming enabled (default)",
-			arch:                             karpv1.ArchitectureAmd64,
-			ossku:                            customscriptsbootstrap.ImageFamilyOSSKUUbuntu2004,
-			kubernetesVersion:                "1.31.0",
-			imageDistro:                      "aks-ubuntu-fips-containerd-20.04-gen2",
-			expectedArtifactStreamingEnabled: true,
-		},
-		{
-			name:                             "AMD64 Ubuntu2204 - Artifact streaming enabled (default)",
+			name:                             "AMD64 default - Artifact streaming disabled",
 			arch:                             karpv1.ArchitectureAmd64,
 			ossku:                            customscriptsbootstrap.ImageFamilyOSSKUUbuntu2204,
 			kubernetesVersion:                "1.31.0",
 			imageDistro:                      "aks-ubuntu-containerd-22.04-gen2",
-			expectedArtifactStreamingEnabled: true,
+			expectedArtifactStreamingEnabled: false,
 		},
 		{
-			name:                             "AMD64 Ubuntu2404 - Artifact streaming enabled (default)",
-			arch:                             karpv1.ArchitectureAmd64,
-			ossku:                            customscriptsbootstrap.ImageFamilyOSSKUUbuntu2404,
-			kubernetesVersion:                "1.34.0",
-			imageDistro:                      "aks-ubuntu-containerd-24.04-gen2",
-			expectedArtifactStreamingEnabled: true,
-		},
-		{
-			name:                             "AMD64 AzureLinux2 - Artifact streaming enabled (default)",
-			arch:                             karpv1.ArchitectureAmd64,
-			ossku:                            customscriptsbootstrap.ImageFamilyOSSKUAzureLinux2,
-			kubernetesVersion:                "1.31.0",
-			imageDistro:                      "aks-azurelinux-v2-gen2",
-			expectedArtifactStreamingEnabled: true,
-		},
-		{
-			name:                             "AMD64 AzureLinux3 - Artifact streaming enabled (default)",
-			arch:                             karpv1.ArchitectureAmd64,
-			ossku:                            customscriptsbootstrap.ImageFamilyOSSKUAzureLinux3,
-			kubernetesVersion:                "1.32.0",
-			imageDistro:                      "aks-azurelinux-v3-gen2",
-			expectedArtifactStreamingEnabled: true,
-		},
-		{
-			name:                             "ARM64 Ubuntu2204 - Artifact streaming disabled",
+			name:                             "ARM64 default - Artifact streaming disabled",
 			arch:                             karpv1.ArchitectureArm64,
 			ossku:                            customscriptsbootstrap.ImageFamilyOSSKUUbuntu2204,
 			kubernetesVersion:                "1.31.0",
 			imageDistro:                      "aks-ubuntu-arm64-containerd-22.04-gen2",
-			expectedArtifactStreamingEnabled: false,
-		},
-		{
-			name:                             "ARM64 AzureLinux2 - Artifact streaming disabled",
-			arch:                             karpv1.ArchitectureArm64,
-			ossku:                            customscriptsbootstrap.ImageFamilyOSSKUAzureLinux2,
-			kubernetesVersion:                "1.31.0",
-			imageDistro:                      "aks-azurelinux-v2-arm64-gen2",
-			expectedArtifactStreamingEnabled: false,
-		},
-		{
-			name:                             "ARM64 AzureLinux3 - Artifact streaming disabled",
-			arch:                             karpv1.ArchitectureArm64,
-			ossku:                            customscriptsbootstrap.ImageFamilyOSSKUAzureLinux3,
-			kubernetesVersion:                "1.32.0",
-			imageDistro:                      "aks-azurelinux-v3-arm64-gen2",
 			expectedArtifactStreamingEnabled: false,
 		},
 		{
@@ -774,7 +764,7 @@ func TestArtifactStreamingEnablement(t *testing.T) {
 		},
 		// Explicit artifact streaming values
 		{
-			name:                             "AMD64 Ubuntu2204 - Artifact streaming explicitly enabled",
+			name:                             "AMD64 - Artifact streaming explicitly enabled",
 			arch:                             karpv1.ArchitectureAmd64,
 			ossku:                            customscriptsbootstrap.ImageFamilyOSSKUUbuntu2204,
 			kubernetesVersion:                "1.31.0",
@@ -783,7 +773,7 @@ func TestArtifactStreamingEnablement(t *testing.T) {
 			expectedArtifactStreamingEnabled: true,
 		},
 		{
-			name:                             "AMD64 Ubuntu2204 - Artifact streaming explicitly disabled",
+			name:                             "AMD64 - Artifact streaming explicitly disabled",
 			arch:                             karpv1.ArchitectureAmd64,
 			ossku:                            customscriptsbootstrap.ImageFamilyOSSKUUbuntu2204,
 			kubernetesVersion:                "1.31.0",
@@ -792,40 +782,13 @@ func TestArtifactStreamingEnablement(t *testing.T) {
 			expectedArtifactStreamingEnabled: false,
 		},
 		{
-			name:                             "AMD64 Ubuntu2004 - Artifact streaming explicitly enabled",
-			arch:                             karpv1.ArchitectureAmd64,
-			ossku:                            customscriptsbootstrap.ImageFamilyOSSKUUbuntu2004,
+			name:                             "ARM64 - Artifact streaming explicitly enabled still disabled (unsupported)",
+			arch:                             karpv1.ArchitectureArm64,
+			ossku:                            customscriptsbootstrap.ImageFamilyOSSKUUbuntu2204,
 			kubernetesVersion:                "1.31.0",
-			imageDistro:                      "aks-ubuntu-fips-containerd-20.04-gen2",
+			imageDistro:                      "aks-ubuntu-arm64-containerd-22.04-gen2",
 			artifactStreaming:                &v1beta1.ArtifactStreaming{Enabled: lo.ToPtr(true)},
-			expectedArtifactStreamingEnabled: true,
-		},
-		{
-			name:                             "AMD64 Ubuntu2404 - Artifact streaming explicitly enabled",
-			arch:                             karpv1.ArchitectureAmd64,
-			ossku:                            customscriptsbootstrap.ImageFamilyOSSKUUbuntu2404,
-			kubernetesVersion:                "1.34.0",
-			imageDistro:                      "aks-ubuntu-containerd-24.04-gen2",
-			artifactStreaming:                &v1beta1.ArtifactStreaming{Enabled: lo.ToPtr(true)},
-			expectedArtifactStreamingEnabled: true,
-		},
-		{
-			name:                             "AMD64 AzureLinux2 - Artifact streaming explicitly enabled",
-			arch:                             karpv1.ArchitectureAmd64,
-			ossku:                            customscriptsbootstrap.ImageFamilyOSSKUAzureLinux2,
-			kubernetesVersion:                "1.31.0",
-			imageDistro:                      "aks-azurelinux-v2-gen2",
-			artifactStreaming:                &v1beta1.ArtifactStreaming{Enabled: lo.ToPtr(true)},
-			expectedArtifactStreamingEnabled: true,
-		},
-		{
-			name:                             "AMD64 AzureLinux3 - Artifact streaming explicitly enabled",
-			arch:                             karpv1.ArchitectureAmd64,
-			ossku:                            customscriptsbootstrap.ImageFamilyOSSKUAzureLinux3,
-			kubernetesVersion:                "1.32.0",
-			imageDistro:                      "aks-azurelinux-v3-gen2",
-			artifactStreaming:                &v1beta1.ArtifactStreaming{Enabled: lo.ToPtr(true)},
-			expectedArtifactStreamingEnabled: true,
+			expectedArtifactStreamingEnabled: false,
 		},
 	}
 
@@ -869,7 +832,7 @@ func TestArtifactStreamingEnablement(t *testing.T) {
 }
 
 func TestFIPSEnablement(t *testing.T) {
-	baseBootstrapper := &customscriptsbootstrap.ProvisionClientBootstrap{
+	baseBootstrapper := &customscriptsbootstrap.ProvisionClientBootstrap{ //nolint:gosec // G101: fake bootstrap token in test fixture
 		ClusterName:                    "test-cluster",
 		KubeletConfig:                  &bootstrap.KubeletConfiguration{MaxPods: int32(110)},
 		SubnetID:                       "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/virtualNetworks/vnet/subnets/subnet",

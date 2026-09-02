@@ -17,6 +17,7 @@ limitations under the License.
 package cloudprovider
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/awslabs/operatorpkg/object"
@@ -31,6 +32,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	corecloudprovider "sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -39,23 +41,26 @@ import (
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 
 	"github.com/Azure/azure-sdk-for-go/profiles/latest/compute/mgmt/compute"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v8"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v9"
+	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 	"github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclass/status"
 	"github.com/Azure/karpenter-provider-azure/pkg/fake"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance/offerings"
 	"github.com/Azure/karpenter-provider-azure/pkg/test"
 	. "github.com/Azure/karpenter-provider-azure/pkg/test/expectations"
-	"github.com/Azure/karpenter-provider-azure/pkg/utils"
+	"github.com/Azure/karpenter-provider-azure/pkg/utils/zones"
 	"github.com/Azure/skewer"
 )
 
 var _ = Describe("CloudProvider", func() {
-	Context("ProvisionMode = AKSMachineAPI", func() {
+	Context("ProvisionMode = AKSMachineAPIHeaderBatch", func() {
 		BeforeEach(func() {
 			testOptions = test.Options(test.OptionsFields{
-				ProvisionMode: lo.ToPtr(consts.ProvisionModeAKSMachineAPI),
+				ProvisionMode: lo.ToPtr(consts.ProvisionModeAKSMachineAPIHeaderBatch),
 				UseSIG:        lo.ToPtr(true),
 			})
 
@@ -64,15 +69,15 @@ var _ = Describe("CloudProvider", func() {
 
 			azureEnv = test.NewEnvironment(ctx, env)
 			azureEnvNonZonal = test.NewEnvironmentNonZonal(ctx, env)
-			statusController = status.NewController(env.Client, azureEnv.KubernetesVersionProvider, azureEnv.ImageProvider, env.KubernetesInterface, azureEnv.SubnetsAPI, azureEnv.DiskEncryptionSetsAPI, testOptions.ParsedDiskEncryptionSetID)
+			statusController = status.NewController(env.Client, azureEnv.KubernetesVersionProvider, azureEnv.ImageProvider, env.KubernetesInterface, env.KubernetesInterface, azureEnv.DynamicInterface, azureEnv.SubnetsAPI, azureEnv.DiskEncryptionSetsAPI, testOptions.ParsedDiskEncryptionSetID, options.FromContext(ctx).NetworkPolicy, options.FromContext(ctx).NetworkPlugin)
 			test.ApplyDefaultStatus(nodeClass, env, testOptions.UseSIG)
 			cloudProvider = New(azureEnv.InstanceTypesProvider, azureEnv.VMInstanceProvider, azureEnv.AKSMachineProvider, recorder, env.Client, azureEnv.ImageProvider, azureEnv.InstanceTypeStore)
 			cloudProviderNonZonal = New(azureEnvNonZonal.InstanceTypesProvider, azureEnvNonZonal.VMInstanceProvider, azureEnvNonZonal.AKSMachineProvider, events.NewRecorder(&record.FakeRecorder{}), env.Client, azureEnvNonZonal.ImageProvider, azureEnvNonZonal.InstanceTypeStore)
 
 			cluster = state.NewCluster(fakeClock, env.Client, cloudProvider)
 			clusterNonZonal = state.NewCluster(fakeClock, env.Client, cloudProviderNonZonal)
-			coreProvisioner = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, fakeClock)
-			coreProvisionerNonZonal = provisioning.NewProvisioner(env.Client, recorder, cloudProviderNonZonal, clusterNonZonal, fakeClock)
+			coreProvisioner = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, fakeClock, deviceallocation.NewController(env.Client))
+			coreProvisionerNonZonal = provisioning.NewProvisioner(env.Client, recorder, cloudProviderNonZonal, clusterNonZonal, fakeClock, deviceallocation.NewController(env.Client))
 
 			ExpectApplied(ctx, env.Client, nodeClass, nodePool)
 			ExpectObjectReconciled(ctx, env.Client, statusController, nodeClass)
@@ -82,8 +87,8 @@ var _ = Describe("CloudProvider", func() {
 			// Wait for any async polling goroutines to complete before resetting
 			cloudProvider.WaitForInstancePromises()
 			cluster.Reset()
-			azureEnv.Reset()
-			azureEnvNonZonal.Reset()
+			azureEnv.Reset(ctx)
+			azureEnvNonZonal.Reset(ctx)
 		})
 
 		Context("Create - Expected Creation Failures", func() {
@@ -91,11 +96,9 @@ var _ = Describe("CloudProvider", func() {
 			It("should fail to provision when LowPriorityCoresQuota errors are hit, then switch capacity type and succeed", func() {
 				// Configure NodePool to allow both spot and on-demand
 				coretest.ReplaceRequirements(nodePool, karpv1.NodeSelectorRequirementWithMinValues{
-					NodeSelectorRequirement: v1.NodeSelectorRequirement{
-						Key:      karpv1.CapacityTypeLabelKey,
-						Operator: v1.NodeSelectorOpIn,
-						Values:   []string{karpv1.CapacityTypeOnDemand, karpv1.CapacityTypeSpot},
-					},
+					Key:      karpv1.CapacityTypeLabelKey,
+					Operator: v1.NodeSelectorOpIn,
+					Values:   []string{karpv1.CapacityTypeOnDemand, karpv1.CapacityTypeSpot},
 				})
 				ExpectApplied(ctx, env.Client, nodePool, nodeClass)
 
@@ -132,11 +135,9 @@ var _ = Describe("CloudProvider", func() {
 			// Ported from VM test: "should fail to provision when OverconstrainedZonalAllocation errors are hit, then switch zone and succeed"
 			It("should fail to provision when OverconstrainedZonalAllocation errors are hit, then switch zone and succeed", func() {
 				coretest.ReplaceRequirements(nodePool, karpv1.NodeSelectorRequirementWithMinValues{
-					NodeSelectorRequirement: v1.NodeSelectorRequirement{
-						Key:      karpv1.CapacityTypeLabelKey,
-						Operator: v1.NodeSelectorOpIn,
-						Values:   []string{karpv1.CapacityTypeOnDemand, karpv1.CapacityTypeSpot},
-					}})
+					Key:      karpv1.CapacityTypeLabelKey,
+					Operator: v1.NodeSelectorOpIn,
+					Values:   []string{karpv1.CapacityTypeOnDemand, karpv1.CapacityTypeSpot}})
 				ExpectApplied(ctx, env.Client, nodePool, nodeClass)
 
 				// Set up async error via BOTH Error and Output (LRO returns both)
@@ -167,13 +168,18 @@ var _ = Describe("CloudProvider", func() {
 			// Ported from VM test: "should fail to provision when OverconstrainedAllocation errors are hit, then switch capacity type and succeed"
 			It("should fail to provision when OverconstrainedAllocation errors are hit, then switch capacity type and succeed", func() {
 				// Configure NodePool to allow multiple capacity types
-				coretest.ReplaceRequirements(nodePool, karpv1.NodeSelectorRequirementWithMinValues{
-					NodeSelectorRequirement: v1.NodeSelectorRequirement{
+				coretest.ReplaceRequirements(nodePool,
+					karpv1.NodeSelectorRequirementWithMinValues{
 						Key:      karpv1.CapacityTypeLabelKey,
 						Operator: v1.NodeSelectorOpIn,
 						Values:   []string{karpv1.CapacityTypeOnDemand, karpv1.CapacityTypeSpot},
 					},
-				})
+					karpv1.NodeSelectorRequirementWithMinValues{
+						Key:      v1beta1.LabelPlacementScope,
+						Operator: v1.NodeSelectorOpIn,
+						Values:   []string{v1beta1.PlacementScopeZonal},
+					},
+				)
 				ExpectApplied(ctx, env.Client, nodePool, nodeClass)
 
 				// Set up async error via BOTH Error and Output (LRO returns both)
@@ -194,22 +200,22 @@ var _ = Describe("CloudProvider", func() {
 				Expect(err).ToNot(HaveOccurred())
 				ExpectUnavailable(azureEnv, testSKU, zone, karpv1.CapacityTypeSpot)
 
-				// Clear both error and output for retry - should succeed with on-demand
+				// Clear both error and output for retry - should succeed with on-demand because
+				// this test constrains the NodePool to zonal placement.
 				azureEnv.AKSMachinesAPI.AfterPollProvisioningErrorOverride = nil
 				ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
 				node := ExpectScheduled(ctx, env.Client, pod)
 				Expect(node.Labels[karpv1.CapacityTypeLabelKey]).To(Equal(karpv1.CapacityTypeOnDemand))
+				Expect(node.Labels).To(HaveKeyWithValue(v1beta1.LabelPlacementScope, v1beta1.PlacementScopeZonal))
 			})
 
-			// Ported from VM test: "should fail to provision when AllocationFailure errors are hit, then switch VM size and succeed"
-			It("should fail to provision when AllocationFailure errors are hit, then switch VM size and succeed", func() {
+			// Ported from VM test: "should fail to provision when AllocationFailure errors are hit, then switch placement and succeed"
+			It("should fail to provision when AllocationFailure errors are hit, then switch placement and succeed", func() {
 				// Configure NodePool to allow multiple instance types
 				coretest.ReplaceRequirements(nodePool, karpv1.NodeSelectorRequirementWithMinValues{
-					NodeSelectorRequirement: v1.NodeSelectorRequirement{
-						Key:      v1.LabelInstanceTypeStable,
-						Operator: v1.NodeSelectorOpIn,
-						Values:   []string{"Standard_D2_v3", "Standard_D64s_v3"},
-					},
+					Key:      v1.LabelInstanceTypeStable,
+					Operator: v1.NodeSelectorOpIn,
+					Values:   []string{"Standard_D2_v3", "Standard_D64s_v3"},
 				})
 				ExpectApplied(ctx, env.Client, nodePool, nodeClass)
 
@@ -230,7 +236,74 @@ var _ = Describe("CloudProvider", func() {
 				Expect(err).ToNot(HaveOccurred())
 				ExpectUnavailable(azureEnv, fake.MakeSKU(initialVMSize), zone, karpv1.CapacityTypeSpot)
 
-				// Clear the error and retry - should succeed with different VM size
+				// Clear the error and retry - should succeed with the same VM size placed regionally
+				azureEnv.AKSMachinesAPI.AfterPollProvisioningErrorOverride = nil
+				ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+				node := ExpectScheduled(ctx, env.Client, pod)
+				Expect(node.Labels[v1.LabelInstanceTypeStable]).To(Equal(initialVMSize))
+				Expect(node.Labels[v1.LabelTopologyZone]).To(Equal(zones.Regional))
+			})
+
+			// Ported from VM test: "should fail to provision when AllocationFailure errors are hit and regional placement is unavailable"
+			It("should fail to provision when AllocationFailure errors are hit and regional placement is unavailable", func() {
+				coretest.ReplaceRequirements(nodePool, karpv1.NodeSelectorRequirementWithMinValues{
+					Key:      v1.LabelInstanceTypeStable,
+					Operator: v1.NodeSelectorOpIn,
+					Values:   []string{"Standard_D2_v3"},
+				})
+				sku := fake.MakeSKU("Standard_D2_v3")
+				azureEnv.UnavailableOfferingsCache.MarkUnavailable(ctx, "RegionalUnavailable", sku, zones.Regional, karpv1.CapacityTypeSpot)
+				azureEnv.UnavailableOfferingsCache.MarkUnavailable(ctx, "RegionalUnavailable", sku, zones.Regional, karpv1.CapacityTypeOnDemand)
+				ExpectApplied(ctx, env.Client, nodePool, nodeClass)
+
+				azureEnv.AKSMachinesAPI.AfterPollProvisioningErrorOverride = fake.AKSMachineAPIProvisioningErrorAllocationFailed()
+
+				pod := coretest.UnschedulablePod()
+				ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+				ExpectNotScheduled(ctx, env.Client, pod)
+
+				Expect(azureEnv.AKSMachinesAPI.AKSMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(BeNumerically(">=", 1))
+				aksMachine := azureEnv.AKSMachinesAPI.AKSMachineCreateOrUpdateBehavior.CalledWithInput.Pop().AKSMachine
+				zone, err := instance.GetAKSLabelZoneFromAKSMachine(&aksMachine, fake.Region)
+				Expect(err).ToNot(HaveOccurred())
+				ExpectUnavailable(azureEnv, sku, zone, karpv1.CapacityTypeSpot)
+				ExpectUnavailable(azureEnv, sku, zone, karpv1.CapacityTypeOnDemand)
+				ExpectUnavailable(azureEnv, sku, zones.Regional, karpv1.CapacityTypeSpot)
+				ExpectUnavailable(azureEnv, sku, zones.Regional, karpv1.CapacityTypeOnDemand)
+
+				azureEnv.AKSMachinesAPI.AfterPollProvisioningErrorOverride = nil
+				ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+				ExpectNotScheduled(ctx, env.Client, pod)
+				Expect(azureEnv.AKSMachinesAPI.AKSMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(Equal(0))
+			})
+
+			It("should fail to provision when AllocationFailure errors are hit and all placements for the VM size are unavailable, then switch VM size and succeed", func() {
+				coretest.ReplaceRequirements(nodePool, karpv1.NodeSelectorRequirementWithMinValues{
+					Key:      v1.LabelInstanceTypeStable,
+					Operator: v1.NodeSelectorOpIn,
+					Values:   []string{"Standard_D2_v3", "Standard_D64s_v3"},
+				})
+				sku := fake.MakeSKU("Standard_D2_v3")
+				azureEnv.UnavailableOfferingsCache.MarkUnavailable(ctx, "RegionalUnavailable", sku, zones.Regional, karpv1.CapacityTypeSpot)
+				azureEnv.UnavailableOfferingsCache.MarkUnavailable(ctx, "RegionalUnavailable", sku, zones.Regional, karpv1.CapacityTypeOnDemand)
+				ExpectApplied(ctx, env.Client, nodePool, nodeClass)
+
+				azureEnv.AKSMachinesAPI.AfterPollProvisioningErrorOverride = fake.AKSMachineAPIProvisioningErrorAllocationFailed()
+
+				pod := coretest.UnschedulablePod()
+				ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+				ExpectNotScheduled(ctx, env.Client, pod)
+
+				Expect(azureEnv.AKSMachinesAPI.AKSMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(BeNumerically(">=", 1))
+				aksMachine := azureEnv.AKSMachinesAPI.AKSMachineCreateOrUpdateBehavior.CalledWithInput.Pop().AKSMachine
+				initialVMSize := lo.FromPtr(aksMachine.Properties.Hardware.VMSize)
+				zone, err := instance.GetAKSLabelZoneFromAKSMachine(&aksMachine, fake.Region)
+				Expect(err).ToNot(HaveOccurred())
+				ExpectUnavailable(azureEnv, fake.MakeSKU(initialVMSize), zone, karpv1.CapacityTypeSpot)
+				ExpectUnavailable(azureEnv, fake.MakeSKU(initialVMSize), zone, karpv1.CapacityTypeOnDemand)
+				ExpectUnavailable(azureEnv, fake.MakeSKU(initialVMSize), zones.Regional, karpv1.CapacityTypeSpot)
+				ExpectUnavailable(azureEnv, fake.MakeSKU(initialVMSize), zones.Regional, karpv1.CapacityTypeOnDemand)
+
 				azureEnv.AKSMachinesAPI.AfterPollProvisioningErrorOverride = nil
 				ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
 				node := ExpectScheduled(ctx, env.Client, pod)
@@ -311,8 +384,8 @@ var _ = Describe("CloudProvider", func() {
 			It("should launch in the NodePool-requested zone", func() {
 				zone, aksMachineZone := fmt.Sprintf("%s-3", fake.Region), "3"
 				nodePool.Spec.Template.Spec.Requirements = []karpv1.NodeSelectorRequirementWithMinValues{
-					{NodeSelectorRequirement: v1.NodeSelectorRequirement{Key: karpv1.CapacityTypeLabelKey, Operator: v1.NodeSelectorOpIn, Values: []string{karpv1.CapacityTypeSpot, karpv1.CapacityTypeOnDemand}}},
-					{NodeSelectorRequirement: v1.NodeSelectorRequirement{Key: v1.LabelTopologyZone, Operator: v1.NodeSelectorOpIn, Values: []string{zone}}},
+					{Key: karpv1.CapacityTypeLabelKey, Operator: v1.NodeSelectorOpIn, Values: []string{karpv1.CapacityTypeSpot, karpv1.CapacityTypeOnDemand}},
+					{Key: v1.LabelTopologyZone, Operator: v1.NodeSelectorOpIn, Values: []string{zone}},
 				}
 				ExpectApplied(ctx, env.Client, nodePool, nodeClass)
 				pod := coretest.UnschedulablePod()
@@ -341,18 +414,17 @@ var _ = Describe("CloudProvider", func() {
 			// Ported from VM test: "should support provisioning non-zonal instance types in zonal regions"
 			It("should support provisioning non-zonal instance types in zonal regions", func() {
 				coretest.ReplaceRequirements(nodePool, karpv1.NodeSelectorRequirementWithMinValues{
-					NodeSelectorRequirement: v1.NodeSelectorRequirement{
-						Key:      v1.LabelInstanceTypeStable,
-						Operator: v1.NodeSelectorOpIn,
-						Values:   []string{"Standard_NC6s_v3"}, // Non-zonal instance type
-					}})
+					Key:      v1.LabelInstanceTypeStable,
+					Operator: v1.NodeSelectorOpIn,
+					Values:   []string{"Standard_NC6s_v3"}, // Non-zonal instance type
+				})
 				ExpectApplied(ctx, env.Client, nodePool, nodeClass)
 
 				pod := coretest.UnschedulablePod()
 				ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
 
 				node := ExpectScheduled(ctx, env.Client, pod)
-				Expect(node.Labels).To(HaveKeyWithValue(v1.LabelTopologyZone, ""))
+				Expect(node.Labels).To(HaveKeyWithValue(v1.LabelTopologyZone, zones.Regional))
 
 				Expect(azureEnv.AKSMachinesAPI.AKSMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(Equal(1))
 				aksMachine := azureEnv.AKSMachinesAPI.AKSMachineCreateOrUpdateBehavior.CalledWithInput.Pop().AKSMachine
@@ -368,11 +440,9 @@ var _ = Describe("CloudProvider", func() {
 				// Specify no instance types and expect to receive a capacity error
 				nodeClaim.Spec.Requirements = []karpv1.NodeSelectorRequirementWithMinValues{
 					{
-						NodeSelectorRequirement: v1.NodeSelectorRequirement{
-							Key:      v1.LabelInstanceTypeStable,
-							Operator: v1.NodeSelectorOpIn,
-							Values:   []string{"doesnotexist"}, // will not match any instance types
-						},
+						Key:      v1.LabelInstanceTypeStable,
+						Operator: v1.NodeSelectorOpIn,
+						Values:   []string{"doesnotexist"}, // will not match any instance types,
 					},
 				}
 
@@ -411,7 +481,7 @@ var _ = Describe("CloudProvider", func() {
 			// Ported from VM test: "should return error when instance type resolution fails"
 			It("should return error when instance type resolution fails", func() {
 				// Create and set up the status controller
-				localStatusController := status.NewController(env.Client, azureEnv.KubernetesVersionProvider, azureEnv.ImageProvider, env.KubernetesInterface, azureEnv.SubnetsAPI, azureEnv.DiskEncryptionSetsAPI, testOptions.ParsedDiskEncryptionSetID)
+				localStatusController := status.NewController(env.Client, azureEnv.KubernetesVersionProvider, azureEnv.ImageProvider, env.KubernetesInterface, env.KubernetesInterface, azureEnv.DynamicInterface, azureEnv.SubnetsAPI, azureEnv.DiskEncryptionSetsAPI, testOptions.ParsedDiskEncryptionSetID, options.FromContext(ctx).NetworkPolicy, options.FromContext(ctx).NetworkPlugin)
 
 				// Set NodeClass to Ready
 				nodeClass.StatusConditions().SetTrue(karpv1.ConditionTypeLaunched)
@@ -479,6 +549,43 @@ var _ = Describe("CloudProvider", func() {
 				Expect(err).To(BeAssignableToTypeOf(&corecloudprovider.CreateError{}))
 				Expect(claim).To(BeNil())
 				Expect(err.Error()).To(ContainSubstring("creating AKS machine failed"))
+
+				// An unclassified failure keeps the generic Launched condition reason.
+				var createErr *corecloudprovider.CreateError
+				Expect(errors.As(err, &createErr)).To(BeTrue())
+				Expect(createErr.ConditionReason).To(Equal(CreateInstanceFailedReason))
+			})
+
+			It("should surface the specific failure reason on the Launched condition for a classified error", func() {
+				ExpectApplied(ctx, env.Client, nodePool, nodeClass)
+
+				testNodeClaim5 := coretest.NodeClaim(karpv1.NodeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{
+							karpv1.NodePoolLabelKey: nodePool.Name,
+						},
+					},
+					Spec: karpv1.NodeClaimSpec{
+						NodeClassRef: &karpv1.NodeClassReference{
+							Name:  nodeClass.Name,
+							Group: object.GVK(nodeClass).Group,
+							Kind:  object.GVK(nodeClass).Kind,
+						},
+					},
+				})
+
+				// A zonal allocation failure is classified by the error handlers.
+				azureEnv.AKSMachinesAPI.AfterPollProvisioningErrorOverride = fake.AKSMachineAPIProvisioningErrorZoneAllocationFailed("Standard_D2_v2", fakeZone1)
+
+				claim, err := CreateAndWaitForPromises(ctx, cloudProvider, azureEnv, testNodeClaim5)
+				Expect(err).To(HaveOccurred())
+				Expect(claim).To(BeNil())
+
+				// The handler's classified reason is threaded through to the Launched condition
+				// rather than being collapsed to the generic CreateInstanceFailed reason.
+				var createErr *corecloudprovider.CreateError
+				Expect(errors.As(err, &createErr)).To(BeTrue())
+				Expect(createErr.ConditionReason).To(Equal(offerings.ZonalAllocationFailureReason))
 			})
 		})
 
@@ -543,11 +650,9 @@ var _ = Describe("CloudProvider", func() {
 				azureEnv.UnavailableOfferingsCache.MarkUnavailable(ctx, "ZonalAllocationFailure", fake.MakeSKU("Standard_D2_v2"), fakeZone1, karpv1.CapacityTypeSpot)
 				azureEnv.UnavailableOfferingsCache.MarkUnavailable(ctx, "ZonalAllocationFailure", fake.MakeSKU("Standard_D2_v2"), fakeZone1, karpv1.CapacityTypeOnDemand)
 				coretest.ReplaceRequirements(nodePool, karpv1.NodeSelectorRequirementWithMinValues{
-					NodeSelectorRequirement: v1.NodeSelectorRequirement{
-						Key:      v1.LabelInstanceTypeStable,
-						Operator: v1.NodeSelectorOpIn,
-						Values:   []string{"Standard_D2_v2"},
-					}})
+					Key:      v1.LabelInstanceTypeStable,
+					Operator: v1.NodeSelectorOpIn,
+					Values:   []string{"Standard_D2_v2"}})
 
 				ExpectApplied(ctx, env.Client, nodePool, nodeClass)
 				pod := coretest.UnschedulablePod()
@@ -563,11 +668,9 @@ var _ = Describe("CloudProvider", func() {
 				azureEnv.AKSMachinesAPI.AfterPollProvisioningErrorOverride = fake.AKSMachineAPIProvisioningErrorZoneAllocationFailed("Standard_D2_v2", "1")
 
 				coretest.ReplaceRequirements(nodePool, karpv1.NodeSelectorRequirementWithMinValues{
-					NodeSelectorRequirement: v1.NodeSelectorRequirement{
-						Key:      v1.LabelInstanceTypeStable,
-						Operator: v1.NodeSelectorOpIn,
-						Values:   []string{"Standard_D2_v2"},
-					}})
+					Key:      v1.LabelInstanceTypeStable,
+					Operator: v1.NodeSelectorOpIn,
+					Values:   []string{"Standard_D2_v2"}})
 
 				ExpectApplied(ctx, env.Client, nodePool, nodeClass)
 				pod := coretest.UnschedulablePod()
@@ -639,7 +742,7 @@ var _ = Describe("CloudProvider", func() {
 
 			// Ported from VM test: DescribeTable "Should not return unavailable offerings"
 			Context("should not return unavailable offerings", func() {
-				It("should not return unavailable offerings - zonal", func() {
+				It("should leave regional offerings available when all real zones are unavailable", func() {
 					for _, zone := range azureEnv.Zones() {
 						azureEnv.UnavailableOfferingsCache.MarkUnavailable(ctx, "SubscriptionQuotaReached", fake.MakeSKU("Standard_D2_v2"), zone, karpv1.CapacityTypeSpot)
 						azureEnv.UnavailableOfferingsCache.MarkUnavailable(ctx, "SubscriptionQuotaReached", fake.MakeSKU("Standard_D2_v2"), zone, karpv1.CapacityTypeOnDemand)
@@ -651,9 +754,11 @@ var _ = Describe("CloudProvider", func() {
 					for _, instanceType := range instanceTypes {
 						if instanceType.Name == "Standard_D2_v2" {
 							// We want to validate we see the offering in the list,
-							// but we also expect it to not have any available offerings
+							// but only the regional offerings should remain available.
 							seeUnavailable = true
-							Expect(len(instanceType.Offerings.Available())).To(Equal(0))
+							Expect(lo.Map(instanceType.Offerings.Available(), func(offering *corecloudprovider.Offering, _ int) string {
+								return offering.Requirements.Get(v1.LabelTopologyZone).Any()
+							})).To(ConsistOf(zones.Regional, zones.Regional))
 						} else {
 							Expect(len(instanceType.Offerings.Available())).To(Not(Equal(0)))
 						}
@@ -721,11 +826,9 @@ var _ = Describe("CloudProvider", func() {
 				azureEnv.UnavailableOfferingsCache.MarkUnavailable(ctx, "SubscriptionQuotaReached", fake.MakeSKU("Standard_F16s_v2"), fakeZone1, karpv1.CapacityTypeOnDemand)
 				azureEnv.UnavailableOfferingsCache.MarkUnavailable(ctx, "SubscriptionQuotaReached", fake.MakeSKU("Standard_F16s_v2"), fakeZone1, karpv1.CapacityTypeSpot)
 				coretest.ReplaceRequirements(nodePool, karpv1.NodeSelectorRequirementWithMinValues{
-					NodeSelectorRequirement: v1.NodeSelectorRequirement{
-						Key:      v1.LabelInstanceTypeStable,
-						Operator: v1.NodeSelectorOpIn,
-						Values:   []string{"Standard_DS2_v2", "Standard_F16s_v2"},
-					}})
+					Key:      v1.LabelInstanceTypeStable,
+					Operator: v1.NodeSelectorOpIn,
+					Values:   []string{"Standard_DS2_v2", "Standard_F16s_v2"}})
 				pods := []*v1.Pod{}
 				for i := 0; i < 2; i++ {
 					pods = append(pods, coretest.UnschedulablePod(coretest.PodOptions{
@@ -757,6 +860,8 @@ var _ = Describe("CloudProvider", func() {
 						azureEnv.UnavailableOfferingsCache.MarkUnavailable(ctx, "SubscriptionQuotaReached", fake.MakeSKU("Standard_D2_v2"), zone, karpv1.CapacityTypeSpot)
 						azureEnv.UnavailableOfferingsCache.MarkUnavailable(ctx, "SubscriptionQuotaReached", fake.MakeSKU("Standard_D2_v2"), zone, karpv1.CapacityTypeOnDemand)
 					}
+					azureEnv.UnavailableOfferingsCache.MarkUnavailable(ctx, "SubscriptionQuotaReached", fake.MakeSKU("Standard_D2_v2"), zones.Regional, karpv1.CapacityTypeSpot)
+					azureEnv.UnavailableOfferingsCache.MarkUnavailable(ctx, "SubscriptionQuotaReached", fake.MakeSKU("Standard_D2_v2"), zones.Regional, karpv1.CapacityTypeOnDemand)
 
 					ExpectApplied(ctx, env.Client, nodeClass, nodePool)
 					pod := coretest.UnschedulablePod(coretest.PodOptions{
@@ -800,16 +905,16 @@ var _ = Describe("CloudProvider", func() {
 
 					coretest.ReplaceRequirements(nodePool,
 						karpv1.NodeSelectorRequirementWithMinValues{
-							NodeSelectorRequirement: v1.NodeSelectorRequirement{Key: v1.LabelInstanceTypeStable, Operator: v1.NodeSelectorOpIn, Values: []string{sku.GetName()}}},
+							Key: v1.LabelInstanceTypeStable, Operator: v1.NodeSelectorOpIn, Values: []string{sku.GetName()}},
 						karpv1.NodeSelectorRequirementWithMinValues{
-							NodeSelectorRequirement: v1.NodeSelectorRequirement{Key: karpv1.CapacityTypeLabelKey, Operator: v1.NodeSelectorOpIn, Values: []string{capacityType}}},
+							Key: karpv1.CapacityTypeLabelKey, Operator: v1.NodeSelectorOpIn, Values: []string{capacityType}},
 					)
 					ExpectApplied(ctx, env.Client, nodeClass, nodePool)
 					pod := coretest.UnschedulablePod()
 					ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
 					ExpectNotScheduled(ctx, env.Client, pod)
 					for _, zoneID := range []string{"1", "2", "3"} {
-						ExpectUnavailable(azureEnv, sku, utils.MakeAKSLabelZoneFromARMZone(fake.Region, zoneID), capacityType)
+						ExpectUnavailable(azureEnv, sku, zones.MakeAKSLabelZoneFromARMZone(fake.Region, zoneID), capacityType)
 					}
 				}
 
@@ -821,6 +926,41 @@ var _ = Describe("CloudProvider", func() {
 				// Ported from VM test: "should mark SKU as unavailable in all zones for OnDemand"
 				It("should mark SKU as unavailable in all zones for OnDemand", func() {
 					AssertUnavailable(defaultTestSKU, karpv1.CapacityTypeOnDemand)
+				})
+			})
+
+			// This is from AKS RP frontend errors rather then CRP
+			Context("SKUNotAvailable - AKS Machine API sync phase", func() {
+				AssertUnavailableSync := func(syncErr *azcore.ResponseError, sku *skewer.SKU, capacityType string) {
+					azureEnv.AKSMachinesAPI.AKSMachineCreateOrUpdateBehavior.BeginError.Set(syncErr)
+
+					coretest.ReplaceRequirements(nodePool,
+						karpv1.NodeSelectorRequirementWithMinValues{
+							Key: v1.LabelInstanceTypeStable, Operator: v1.NodeSelectorOpIn, Values: []string{sku.GetName()}},
+						karpv1.NodeSelectorRequirementWithMinValues{
+							Key: karpv1.CapacityTypeLabelKey, Operator: v1.NodeSelectorOpIn, Values: []string{capacityType}},
+					)
+					ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+					pod := coretest.UnschedulablePod()
+					ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+					ExpectNotScheduled(ctx, env.Client, pod)
+					for _, zoneID := range []string{"1", "2", "3"} {
+						ExpectUnavailable(azureEnv, sku, zones.MakeAKSLabelZoneFromARMZone(fake.Region, zoneID), capacityType)
+					}
+				}
+
+				It("should handle VMSizeNotSupported sync error and mark SKU unavailable", func() {
+					AssertUnavailableSync(
+						fake.AKSMachineAPIErrorVMSizeNotSupported(lo.FromPtr(defaultTestSKU.Name), azureEnv.SubscriptionID, fake.Region),
+						defaultTestSKU, karpv1.CapacityTypeOnDemand,
+					)
+				})
+
+				It("should handle BadRequest 'not supported for subscription' sync error and mark SKU unavailable", func() {
+					AssertUnavailableSync(
+						fake.AKSMachineAPIErrorVMSizeNotSupportedBadRequest(lo.FromPtr(defaultTestSKU.Name), azureEnv.SubscriptionID, fake.Region),
+						defaultTestSKU, karpv1.CapacityTypeSpot,
+					)
 				})
 			})
 		})

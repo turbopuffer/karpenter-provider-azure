@@ -37,6 +37,7 @@ import (
 	clock "k8s.io/utils/clock/testing"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	corecloudprovider "sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -60,7 +61,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate"
 	"github.com/Azure/karpenter-provider-azure/pkg/test"
 	. "github.com/Azure/karpenter-provider-azure/pkg/test/expectations"
-	"github.com/Azure/karpenter-provider-azure/pkg/utils"
+	"github.com/Azure/karpenter-provider-azure/pkg/utils/zones"
 )
 
 var ctx context.Context
@@ -85,14 +86,14 @@ func TestAzure(t *testing.T) {
 	ctx = options.ToContext(ctx, test.Options())
 	env = coretest.NewEnvironment(coretest.WithCRDs(apis.CRDs...), coretest.WithCRDs(v1alpha1.CRDs...))
 
-	ctx, stop = context.WithCancel(ctx)
+	ctx, stop = context.WithCancel(ctx) //nolint:gosec // G118: stop is called in AfterSuite
 	azureEnv = test.NewEnvironment(ctx, env)
 	azureEnvNonZonal = test.NewEnvironmentNonZonal(ctx, env)
 	cloudProvider = cloudprovider.New(azureEnv.InstanceTypesProvider, azureEnv.VMInstanceProvider, azureEnv.AKSMachineProvider, events.NewRecorder(&record.FakeRecorder{}), env.Client, azureEnv.ImageProvider, azureEnv.InstanceTypeStore)
 	cloudProviderNonZonal = cloudprovider.New(azureEnvNonZonal.InstanceTypesProvider, azureEnvNonZonal.VMInstanceProvider, azureEnvNonZonal.AKSMachineProvider, events.NewRecorder(&record.FakeRecorder{}), env.Client, azureEnvNonZonal.ImageProvider, azureEnv.InstanceTypeStore)
 	fakeClock = &clock.FakeClock{}
 	cluster = state.NewCluster(fakeClock, env.Client, cloudProvider)
-	coreProvisioner = provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, fakeClock)
+	coreProvisioner = provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, fakeClock, deviceallocation.NewController(env.Client))
 	RunSpecs(t, "Provider/Azure")
 }
 
@@ -185,14 +186,8 @@ func vmSizeFromVM(vm *armcompute.VirtualMachine) string {
 }
 
 func zoneFromVM(vm *armcompute.VirtualMachine) string {
-	if vm == nil || vm.Location == nil || len(vm.Zones) == 0 {
-		return ""
-	}
-	zonePtr := vm.Zones[0]
-	if zonePtr == nil {
-		return ""
-	}
-	return utils.MakeAKSLabelZoneFromARMZone(strings.ToLower(lo.FromPtr(vm.Location)), lo.FromPtr(zonePtr))
+	zone, _ := zones.MakeAKSLabelZoneFromVM(vm)
+	return zone
 }
 
 // Attention: tests like below for AKSMachineInstanceProvider are added to cloudprovider module to reflect its end-to-end nature.
@@ -236,8 +231,8 @@ var _ = Describe("VMInstanceProvider", func() {
 			},
 		})
 
-		azureEnv.Reset()
-		azureEnvNonZonal.Reset()
+		azureEnv.Reset(ctx)
+		azureEnvNonZonal.Reset(ctx)
 		cluster.Reset()
 	})
 
@@ -346,6 +341,10 @@ var _ = Describe("VMInstanceProvider", func() {
 			for _, zone := range azEnv.Zones() {
 				azEnv.UnavailableOfferingsCache.MarkUnavailable(ctx, "SubscriptionQuotaReached", fake.MakeSKU("Standard_D2_v2"), zone, karpv1.CapacityTypeSpot)
 				azEnv.UnavailableOfferingsCache.MarkUnavailable(ctx, "SubscriptionQuotaReached", fake.MakeSKU("Standard_D2_v2"), zone, karpv1.CapacityTypeOnDemand)
+			}
+			if azEnv == azureEnv {
+				azEnv.UnavailableOfferingsCache.MarkUnavailable(ctx, "SubscriptionQuotaReached", fake.MakeSKU("Standard_D2_v2"), zones.Regional, karpv1.CapacityTypeSpot)
+				azEnv.UnavailableOfferingsCache.MarkUnavailable(ctx, "SubscriptionQuotaReached", fake.MakeSKU("Standard_D2_v2"), zones.Regional, karpv1.CapacityTypeOnDemand)
 			}
 			instanceTypes, err := cp.GetInstanceTypes(ctx, nodePool)
 			Expect(err).ToNot(HaveOccurred())
@@ -641,8 +640,6 @@ var _ = Describe("VMInstanceProvider", func() {
 			test.Options(test.OptionsFields{
 				SubnetID: lo.ToPtr("/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/sillygeese/providers/Microsoft.Network/virtualNetworks/aks-vnet-12345678/subnets/aks-subnet"), // different RG
 			}))
-		nsg := test.MakeNetworkSecurityGroup(options.FromContext(ctx).NodeResourceGroup, "aks-agentpool-00000000-nsg")
-		azureEnv.NetworkSecurityGroupAPI.NSGs.Store(nsg.ID, nsg)
 
 		ExpectApplied(ctx, env.Client, nodePool, nodeClass)
 
@@ -655,7 +652,7 @@ var _ = Describe("VMInstanceProvider", func() {
 		Expect(nic).ToNot(BeNil())
 		ExpectApplied(ctx, env.Client, nodePool, nodeClass)
 
-		expectedNSGID := fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/networkSecurityGroups/aks-agentpool-%s-nsg", azureEnv.SubscriptionID, options.FromContext(ctx).NodeResourceGroup, options.FromContext(ctx).ClusterID)
+		expectedNSGID := fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/networkSecurityGroups/aks-agentpool-%s-nsg", azureEnv.SubscriptionID, options.FromContext(ctx).NodeResourceGroup, "00000000")
 		Expect(nic.Properties.NetworkSecurityGroup).ToNot(BeNil())
 		Expect(lo.FromPtr(nic.Properties.NetworkSecurityGroup.ID)).To(Equal(expectedNSGID))
 	})
@@ -663,9 +660,6 @@ var _ = Describe("VMInstanceProvider", func() {
 	It("should attach nsg to nic when NodeClass VNET specified", func() {
 		nodeClass.Spec.VNETSubnetID = lo.ToPtr("/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/sillygeese/providers/Microsoft.Network/virtualNetworks/aks-vnet-12345678/subnets/aks-subnet") // different RG
 
-		nsg := test.MakeNetworkSecurityGroup(options.FromContext(ctx).NodeResourceGroup, "aks-agentpool-00000000-nsg")
-		azureEnv.NetworkSecurityGroupAPI.NSGs.Store(nsg.ID, nsg)
-
 		ExpectApplied(ctx, env.Client, nodePool, nodeClass)
 
 		pod := coretest.UnschedulablePod(coretest.PodOptions{})
@@ -677,7 +671,7 @@ var _ = Describe("VMInstanceProvider", func() {
 		Expect(nic).ToNot(BeNil())
 		ExpectApplied(ctx, env.Client, nodePool, nodeClass)
 
-		expectedNSGID := fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/networkSecurityGroups/aks-agentpool-%s-nsg", azureEnv.SubscriptionID, options.FromContext(ctx).NodeResourceGroup, options.FromContext(ctx).ClusterID)
+		expectedNSGID := fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/networkSecurityGroups/aks-agentpool-%s-nsg", azureEnv.SubscriptionID, options.FromContext(ctx).NodeResourceGroup, "00000000")
 		Expect(nic.Properties.NetworkSecurityGroup).ToNot(BeNil())
 		Expect(lo.FromPtr(nic.Properties.NetworkSecurityGroup.ID)).To(Equal(expectedNSGID))
 	})
@@ -887,18 +881,14 @@ var _ = Describe("VMInstanceProvider", func() {
 			// vCPU of work cannot fit in a 50-core quota, so the remainder falls back to D_v5.
 			coretest.ReplaceRequirements(nodePool,
 				karpv1.NodeSelectorRequirementWithMinValues{
-					NodeSelectorRequirement: v1.NodeSelectorRequirement{
-						Key:      v1beta1.LabelSKUSeries,
-						Operator: v1.NodeSelectorOpIn,
-						Values:   []string{"Ds_v3", "D_v5"},
-					},
+					Key:      v1beta1.LabelSKUSeries,
+					Operator: v1.NodeSelectorOpIn,
+					Values:   []string{"Ds_v3", "D_v5"},
 				},
 				karpv1.NodeSelectorRequirementWithMinValues{
-					NodeSelectorRequirement: v1.NodeSelectorRequirement{
-						Key:      karpv1.CapacityTypeLabelKey,
-						Operator: v1.NodeSelectorOpIn,
-						Values:   []string{karpv1.CapacityTypeOnDemand},
-					},
+					Key:      karpv1.CapacityTypeLabelKey,
+					Operator: v1.NodeSelectorOpIn,
+					Values:   []string{karpv1.CapacityTypeOnDemand},
 				},
 			)
 			ExpectApplied(ctx, env.Client, nodePool, nodeClass)
@@ -1072,18 +1062,14 @@ var _ = Describe("VMInstanceProvider", func() {
 			})
 			coretest.ReplaceRequirements(nodePoolA,
 				karpv1.NodeSelectorRequirementWithMinValues{
-					NodeSelectorRequirement: v1.NodeSelectorRequirement{
-						Key:      v1beta1.LabelSKUSeries,
-						Operator: v1.NodeSelectorOpIn,
-						Values:   []string{"Ds_v3"},
-					},
+					Key:      v1beta1.LabelSKUSeries,
+					Operator: v1.NodeSelectorOpIn,
+					Values:   []string{"Ds_v3"},
 				},
 				karpv1.NodeSelectorRequirementWithMinValues{
-					NodeSelectorRequirement: v1.NodeSelectorRequirement{
-						Key:      karpv1.CapacityTypeLabelKey,
-						Operator: v1.NodeSelectorOpIn,
-						Values:   []string{karpv1.CapacityTypeOnDemand},
-					},
+					Key:      karpv1.CapacityTypeLabelKey,
+					Operator: v1.NodeSelectorOpIn,
+					Values:   []string{karpv1.CapacityTypeOnDemand},
 				},
 			)
 
@@ -1104,18 +1090,14 @@ var _ = Describe("VMInstanceProvider", func() {
 			})
 			coretest.ReplaceRequirements(nodePoolB,
 				karpv1.NodeSelectorRequirementWithMinValues{
-					NodeSelectorRequirement: v1.NodeSelectorRequirement{
-						Key:      v1beta1.LabelSKUSeries,
-						Operator: v1.NodeSelectorOpIn,
-						Values:   []string{"D_v5"},
-					},
+					Key:      v1beta1.LabelSKUSeries,
+					Operator: v1.NodeSelectorOpIn,
+					Values:   []string{"D_v5"},
 				},
 				karpv1.NodeSelectorRequirementWithMinValues{
-					NodeSelectorRequirement: v1.NodeSelectorRequirement{
-						Key:      karpv1.CapacityTypeLabelKey,
-						Operator: v1.NodeSelectorOpIn,
-						Values:   []string{karpv1.CapacityTypeOnDemand},
-					},
+					Key:      karpv1.CapacityTypeLabelKey,
+					Operator: v1.NodeSelectorOpIn,
+					Values:   []string{karpv1.CapacityTypeOnDemand},
 				},
 			)
 
@@ -1284,6 +1266,69 @@ var _ = Describe("VMInstanceProvider", func() {
 				"Standard_D2s_v3": 1,
 				"Standard_D2_v5":  25,
 			}))
+		})
+	})
+
+	Context("stale load balancer cache recovery", func() {
+		It("should retry NIC creation after refreshing a stale backend pool reference", func() {
+			// Seed the fake with a standard and internal LB
+			nodeResourceGroup := options.FromContext(ctx).NodeResourceGroup
+			standardLB := test.MakeStandardLoadBalancer(nodeResourceGroup, "kubernetes", true)
+			internalLB := test.MakeStandardLoadBalancer(nodeResourceGroup, "kubernetes-internal", false)
+			azureEnv.LoadBalancersAPI.LoadBalancers.Store(lo.FromPtr(standardLB.ID), standardLB)
+			azureEnv.LoadBalancersAPI.LoadBalancers.Store(lo.FromPtr(internalLB.ID), internalLB)
+
+			// Warm the LB cache so the provider has a generation-1 snapshot
+			_, err := azureEnv.LoadBalancerProvider.LoadBalancerBackendPools(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			// Delete the internal LB from the fake (simulates Azure-side deletion while cache is warm)
+			azureEnv.LoadBalancersAPI.LoadBalancers.Delete(lo.FromPtr(internalLB.ID))
+
+			// Make the first NIC creation fail with InvalidResourceReference for the now-deleted pool,
+			// then succeed on retry (after the LB cache is refreshed).
+			deletedPoolID := fake.MakeBackendAddressPoolID(nodeResourceGroup, "kubernetes-internal", "kubernetes")
+			nicCreateCalls := 0
+			azureEnv.NetworkInterfacesAPI.NetworkInterfacesCreateOrUpdateBehavior.SetCustomTransformer(
+				func(input *fake.NetworkInterfaceCreateOrUpdateInput) error {
+					nicCreateCalls++
+					if nicCreateCalls == 1 {
+						return fmt.Errorf(
+							"Resource %s referenced by resource /subscriptions/test/resourceGroups/%s/providers/Microsoft.Network/networkInterfaces/%s was not found. "+
+								"Please make sure that the referenced resource exists, and that both resources are in the same region.: %w",
+							deletedPoolID,
+							nodeResourceGroup,
+							input.InterfaceName,
+							&azcore.ResponseError{ErrorCode: "InvalidResourceReference", StatusCode: 400},
+						)
+					}
+					return nil
+				},
+			)
+
+			ExpectApplied(ctx, env.Client, nodeClaim, nodePool, nodeClass)
+			pod := coretest.UnschedulablePod(coretest.PodOptions{})
+			ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+			ExpectScheduled(ctx, env.Client, pod)
+
+			// NIC creation should have been called twice: first fails, refresh, second succeeds
+			Expect(nicCreateCalls).To(Equal(2))
+
+			// The second NIC request should NOT include the deleted pool
+			Expect(azureEnv.NetworkInterfacesAPI.NetworkInterfacesCreateOrUpdateBehavior.CalledWithInput.Len()).To(Equal(2))
+			// Pop returns most recent first (stack order)
+			secondNIC := azureEnv.NetworkInterfacesAPI.NetworkInterfacesCreateOrUpdateBehavior.CalledWithInput.Pop()
+			firstNIC := azureEnv.NetworkInterfacesAPI.NetworkInterfacesCreateOrUpdateBehavior.CalledWithInput.Pop()
+
+			// First attempt included the deleted pool
+			firstPools := firstNIC.Interface.Properties.IPConfigurations[0].Properties.LoadBalancerBackendAddressPools
+			firstPoolIDs := lo.Map(firstPools, func(p *armnetwork.BackendAddressPool, _ int) string { return lo.FromPtr(p.ID) })
+			Expect(firstPoolIDs).To(ContainElement(deletedPoolID))
+
+			// Second attempt should not include the deleted pool
+			secondPools := secondNIC.Interface.Properties.IPConfigurations[0].Properties.LoadBalancerBackendAddressPools
+			secondPoolIDs := lo.Map(secondPools, func(p *armnetwork.BackendAddressPool, _ int) string { return lo.FromPtr(p.ID) })
+			Expect(secondPoolIDs).ToNot(ContainElement(deletedPoolID))
 		})
 	})
 })

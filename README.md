@@ -37,11 +37,16 @@ Karpenter improves the efficiency and cost of running workloads on Kubernetes cl
 * **Consolidating** existing nodes onto cheaper nodes with higher utilization per node
 
 
-## Node Auto Provisioning (NAP) vs. Self-hosted
+## Node Auto Provisioning (NAP) vs. Self-hosted Karpenter
 
 Karpenter provider for AKS can be used in two modes:
-* **[Node Auto Provisioning (NAP)](https://learn.microsoft.com/azure/aks/node-autoprovision?tabs=azure-cli) mode**: Karpenter is run by AKS as a managed addon similar to managed Cluster Autoscaler. This is the recommended mode for most users as it has more test coverage, improved scale-up speed, automatic maintenance window integration, support for some additional SKUs, and various other improvements over self-hosted. Follow the instructions in Node Auto Provisioning [documentation](https://learn.microsoft.com/azure/aks/node-autoprovision?tabs=azure-cli) to use Karpenter in that mode.
-* **Self-hosted mode**: Karpenter is run as a standalone deployment in the cluster. This mode is useful for advanced users who want to customize or experiment with Karpenter's deployment.
+* **[Node Auto Provisioning (NAP)](https://learn.microsoft.com/azure/aks/node-autoprovision?tabs=azure-cli) mode**: Karpenter is run by AKS as a managed addon similar to managed Cluster Autoscaler. This is the recommended mode for most users as it has more test coverage, improved scale-up speed, automatic maintenance window integration, support for some additional SKUs, and various other improvements over self-hosted Karpenter. NAP also leverages Node Provisioning Service for optimized performance and scalability. Follow the instructions in Node Auto Provisioning [documentation](https://learn.microsoft.com/azure/aks/node-autoprovision?tabs=azure-cli) to use Karpenter in that mode. NAP manages:
+  * Token rotation
+  * Helm charts
+  * Karpenter version updates
+  * VM OS disk updates
+  * node image upgrades (Linux)
+* **Self-hosted mode**: Karpenter is run as a standalone deployment in the cluster. This mode is useful for advanced users who want to customize or experiment with Karpenter's deployment, use custom Helm charts, or integrate non-standard workflows. Self-hosted mode requires users to directly manage upgrades, token rotation, and helm charts.
 
 ## Known limitations
 
@@ -50,9 +55,6 @@ The following AKS features are not supported:
 * Kubenet and Calico.
 * IPv6 clusters.
 * [Service Principal](https://learn.microsoft.com/azure/aks/kubernetes-service-principal) based clusters. A system-assigned or user-assigned managed identity must be used.
-* Disk Encryption sets.
-* Custom CA Certificates.
-* [HTTP proxy](https://learn.microsoft.com/azure/aks/http-proxy).
 * Clusters running Karpenter should not be [stopped](https://learn.microsoft.com/azure/aks/start-stop-cluster).
 * All cluster egress [outbound types](https://learn.microsoft.com/azure/aks/egress-outboundtype) are supported, however the type can't be changed after the cluster is created.
 
@@ -60,9 +62,9 @@ The following AKS features are not supported:
 
 Follow the instructions in the Node Auto Provisioning [documentation](https://learn.microsoft.com/azure/aks/node-autoprovision?tabs=azure-cli).
 
-## Installation (self-hosted)
+## Installation (self-hosted Karpenter)
 
-**⚠️ Warning ⚠️** We strongly recommend using [Node Auto Provisioning](#installation-nap) (aka managed Karpenter) instead of self-hosted.
+**⚠️ Warning ⚠️** We strongly recommend using [Node Auto Provisioning](#installation-nap) (aka managed Karpenter) instead of self-hosted. Official support via Microsoft support channels is limited to NAP. Self-hosted Karpenter is supported primarily via GitHub issues, and subject to best-effort response time.
 
 This guide shows how to get started with Karpenter by creating an AKS cluster and installing Karpenter.
 
@@ -152,9 +154,9 @@ The Karpenter Helm chart requires specific configuration values to work with an 
 
 ```bash
 # Select version to install
-export KARPENTER_VERSION=1.6.1
+export KARPENTER_VERSION=1.10.2
 
-# Download the specific's version template
+# Download the template for the selected version
 curl -sO https://raw.githubusercontent.com/Azure/karpenter-provider-azure/v${KARPENTER_VERSION}/karpenter-values-template.yaml
 
 # use configure-values.sh to generate karpenter-values.yaml
@@ -256,6 +258,11 @@ spec:
         - key: karpenter.azure.com/sku-family
           operator: In
           values: [D]
+        # Optional: constrain Azure placement to zonal capacity.
+        # Use "regional" instead to request non-zonal capacity, labeled with topology.kubernetes.io/zone=0.
+        # - key: karpenter.azure.com/placement-scope
+        #   operator: In
+        #   values: ["zonal"]
       expireAfter: Never
   limits:
     cpu: 100
@@ -274,6 +281,8 @@ spec:
 EOF
 ```
 Karpenter is now active and ready to begin provisioning nodes.
+
+By default, Azure NodePools can use both zonal and regional VM placement when the selected SKU supports it. Add a `karpenter.azure.com/placement-scope` requirement with `zonal` or `regional` to choose one explicitly; regional nodes are represented with `topology.kubernetes.io/zone=0`.
 
 ### Scale up deployment
 
@@ -358,3 +367,5 @@ Come discuss Karpenter in the [#karpenter](https://kubernetes.slack.com/archives
 Check out the [Docs](https://karpenter.sh/) to learn more.
 
 Check out our [contributing guide](https://github.com/Azure/karpenter-provider-azure/blob/main/CONTRIBUTING.md).
+
+This open-source project is subject to best-effort support by project maintainers and not covered by Microsoft support channels. [File an issue](https://github.com/Azure/karpenter-provider-azure/issues) in this project for any questions, feature requests, or issues.

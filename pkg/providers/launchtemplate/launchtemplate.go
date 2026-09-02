@@ -24,6 +24,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily"
 	karplabels "github.com/Azure/karpenter-provider-azure/pkg/providers/labels"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate/parameters"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/networksecuritygroup"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
 	"github.com/samber/lo"
 	v1 "k8s.io/api/core/v1"
@@ -60,6 +61,7 @@ type Provider struct {
 	imageFamily             imagefamily.Resolver
 	imageProvider           imagefamily.NodeImageProvider
 	kubeClient              kubernetes.Interface
+	nsgProvider             *networksecuritygroup.Provider
 	caBundle                *string
 	clusterEndpoint         string
 	tenantID                string
@@ -80,6 +82,7 @@ func NewProvider(
 	imageFamily imagefamily.Resolver,
 	imageProvider imagefamily.NodeImageProvider,
 	kubeClient kubernetes.Interface,
+	nsgProvider *networksecuritygroup.Provider,
 	caBundle *string,
 	clusterEndpoint string,
 	tenantID,
@@ -94,6 +97,7 @@ func NewProvider(
 		imageFamily:             imageFamily,
 		imageProvider:           imageProvider,
 		kubeClient:              kubeClient,
+		nsgProvider:             nsgProvider,
 		caBundle:                caBundle,
 		clusterEndpoint:         clusterEndpoint,
 		tenantID:                tenantID,
@@ -160,8 +164,22 @@ func (p *Provider) getStaticParameters(
 	}
 	labels = lo.Assign(baseLabels, labels)
 
+	// Remove labels kubelet can't set (e.g. kubernetes.io/*, k8s.io/* outside allowed namespaces)
+	labels = lo.OmitBy(labels, func(key string, _ string) bool {
+		return !karplabels.CanKubeletSetLabel(key)
+	})
+
 	// ATTENTION!!!: changes here will NOT be effective on AKS machine nodes (ProvisionModeAKSMachineAPI); See aksmachineinstance.go/aksmachineinstancehelpers.go.
 	// Refactoring for code unification is not being invested immediately.
+
+	nsg, err := p.nsgProvider.ManagedNetworkSecurityGroup(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("getting managed network security group: %w", err)
+	}
+	nsgName := lo.FromPtr(nsg.Name)
+	clusterID := networksecuritygroup.GetClusterIDFromNSGName(nsgName)
+	routeTableName := fmt.Sprintf("aks-agentpool-%s-routetable", clusterID)
+
 	return &parameters.StaticParameters{
 		ClusterName:                    options.FromContext(ctx).ClusterName,
 		ClusterEndpoint:                p.clusterEndpoint,
@@ -172,12 +190,14 @@ func (p *Provider) getStaticParameters(
 		GPUDriverVersion:               utils.GetGPUDriverVersion(instanceType.Name),
 		GPUDriverType:                  utils.GetGPUDriverType(instanceType.Name),
 		GPUImageSHA:                    utils.GetAKSGPUImageSHA(instanceType.Name),
+		GPUDriverInstallationEnabled:   nodeClass.IsGPUDriverInstallationEnabled(),
 		TenantID:                       p.tenantID,
 		SubscriptionID:                 p.subscriptionID,
 		KubeletIdentityClientID:        p.kubeletIdentityClientID,
 		ResourceGroup:                  p.resourceGroup,
 		Location:                       p.location,
-		ClusterID:                      options.FromContext(ctx).ClusterID,
+		NetworkSecurityGroupName:       nsgName,
+		RouteTableName:                 routeTableName,
 		APIServerName:                  options.FromContext(ctx).GetAPIServerName(),
 		KubeletClientTLSBootstrapToken: p.getBootstrapToken(ctx),
 		NetworkPlugin:                  getAgentbakerNetworkPlugin(ctx),

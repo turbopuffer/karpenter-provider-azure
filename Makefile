@@ -12,6 +12,11 @@ KARPENTER_NAMESPACE ?= kube-system
 # TODO: revisit testing tools (temporarily excluded here, for make verify)
 MOD_DIRS = $(shell find . -name go.mod -type f ! -path "./test/*" | xargs dirname)
 KARPENTER_CORE_DIR = $(shell go list -m -f '{{ .Dir }}' sigs.k8s.io/karpenter)
+KARPENTER_CORE_CRDS = \
+	karpenter.sh_nodeclaims.yaml \
+	karpenter.sh_nodeoverlays.yaml \
+	karpenter.sh_nodepools.yaml
+SUPPORTED_CRDS = karpenter.azure.com_aksnodeclasses.yaml $(KARPENTER_CORE_CRDS)
 
 # TEST_SUITE enables you to select a specific test suite directory to run "make e2etests" or "make test" against
 TEST_SUITE ?= "..."
@@ -65,13 +70,13 @@ e2etests: ## Run the e2e suite against your local cluster
 		--ginkgo.grace-period=3m \
 		--ginkgo.vv
 
-upstream-e2etests:
+upstream-e2etests: tidy download
 	AZURE_CLUSTER_NAME=${AZURE_CLUSTER_NAME} AZURE_ACR_NAME=${AZURE_ACR_NAME} AZURE_RESOURCE_GROUP=${AZURE_RESOURCE_GROUP} AZURE_SUBSCRIPTION_ID=${AZURE_SUBSCRIPTION_ID} AZURE_LOCATION=${AZURE_LOCATION} VNET_RESOURCE_GROUP=${VNET_RESOURCE_GROUP} \
-	go test \
+	cd $(KARPENTER_CORE_DIR) && go test \
 		-count 1 \
 		-timeout 1h \
 		-v \
-		$(KARPENTER_CORE_DIR)/test/suites/$(shell echo $(TEST_SUITE) | tr A-Z a-z)/... \
+		./test/suites/... \
 		--ginkgo.focus="${FOCUS}" \
 		--ginkgo.timeout=1h \
 		--ginkgo.grace-period=5m \
@@ -90,12 +95,12 @@ verify: tidy download ## Verify code. Includes dependencies, linting, formatting
 	make az-swagger-generate-clients-raw
 	go generate ./...
 	hack/boilerplate.sh
-	cp $(KARPENTER_CORE_DIR)/pkg/apis/crds/* pkg/apis/crds
+	cp $(addprefix $(KARPENTER_CORE_DIR)/pkg/apis/crds/,$(KARPENTER_CORE_CRDS)) pkg/apis/crds
 	hack/validation/kubelet.sh
 	hack/validation/labels.sh
 	hack/validation/requirements.sh
 	hack/mutation/kubectl_get_ux.sh
-	cp pkg/apis/crds/* charts/karpenter-crd/templates
+	cp $(addprefix pkg/apis/crds/,$(SUPPORTED_CRDS)) charts/karpenter-crd/templates
 	hack/github/dependabot.sh
 	$(foreach dir,$(MOD_DIRS),cd $(dir) && golangci-lint-custom run $(newline))
 	@git diff --quiet ||\
@@ -113,10 +118,27 @@ vulncheck: ## Verify code vulnerabilities
 	@trivy filesystem --ignore-unfixed --scanners vuln --exit-code 1 go.mod
 
 licenses: download ## Verifies dependency licenses
-	! go-licenses csv ./... | grep -v -e 'MIT' -e 'Apache-2.0' -e 'BSD-3-Clause' -e 'BSD-2-Clause' -e 'ISC' -e 'MPL-2.0'
+	LICENSEFILE=$$(mktemp /tmp/licenses-XXXXXX.csv) && \
+	go-licenses csv ./... > $$LICENSEFILE && \
+	! grep -v -e 'MIT' -e 'Apache-2.0' -e 'BSD-3-Clause' -e 'BSD-2-Clause' -e 'ISC' -e 'MPL-2.0' $$LICENSEFILE
 
-codegen: ## Auto generate files based on Azure API responses
-	./hack/codegen.sh
+codegen: codegen-prod codegen-test ## Auto generate files based on Azure API responses
+
+codegen-prod: codegen-pricing codegen-allazuresku ## Generate codegen data used in production
+
+codegen-test: codegen-locations codegen-skugen ## Generate codegen test data
+
+codegen-pricing: ## Generate pricing data
+	./hack/codegen.sh pricing
+
+codegen-locations: ## Generate locations data
+	./hack/codegen.sh locations
+
+codegen-skugen: ## Generate SKU test fakes
+	./hack/codegen.sh skugen
+
+codegen-allazureskus: ## Generate all Azure VM SKU names
+	./hack/codegen.sh allazureskus
 
 snapshot: az-login ## Builds and publishes snapshot release
 	./hack/release/snapshot.sh
@@ -133,9 +155,30 @@ tidy: ## Recursively "go mod tidy" on all directories where go.mod exists
 download: ## Recursively "go mod download" on all directories where go.mod exists
 	$(foreach dir,$(MOD_DIRS),cd $(dir) && go mod download $(newline))
 
-.PHONY: help presubmit ci-test ci-non-test test deflake deflake-until-it-fails e2etests upstream-e2etests coverage verify vulncheck licenses codegen snapshot release toolchain tidy download
+.PHONY: help presubmit ci-test ci-non-test test deflake deflake-until-it-fails e2etests upstream-e2etests coverage verify vulncheck licenses codegen codegen-pricing codegen-locations codegen-skugen codegen-allazureskus snapshot release toolchain tidy download
 
 define newline
 
 
 endef
+
+# Announce all explicit targets as they run to allow easier tracing of issues
+# 
+# Every target is preceded by a blank line and a header like this:
+# ----- <target> ----
+#
+# NOTE: This block must be at the very end of the entrypoint Makefile so it's parsed last
+
+ANNOUNCED_TARGETS := $(filter-out FORCE .PHONY,$(shell awk -F: \
+    '/^[a-zA-Z0-9_.\/-]+([[:space:]]+[a-zA-Z0-9_.\/-]+)*[[:space:]]*:/ \
+    { print $$1 }' $(MAKEFILE_LIST)))
+
+.PHONY: FORCE
+
+$(ANNOUNCED_TARGETS): %: | .announce-%
+
+.announce-%: FORCE
+	@printf '\n----- %s -----\n' '$*'
+
+FORCE:
+

@@ -38,13 +38,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 
-	//nolint:SA1019 // deprecated package
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v8"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v9"
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
-	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 	"github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclaim/inplaceupdate"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 
@@ -58,6 +56,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
 	nodeclaimutils "github.com/Azure/karpenter-provider-azure/pkg/utils/nodeclaim"
+	"github.com/Azure/karpenter-provider-azure/pkg/utils/zones"
 
 	coreapis "sigs.k8s.io/karpenter/pkg/apis"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -74,6 +73,7 @@ const (
 	NodeClassReadinessUnknownReason    = "NodeClassReadinessUnknown"
 	InstanceTypeResolutionFailedReason = "InstanceTypeResolutionFailed"
 	CreateInstanceFailedReason         = "CreateInstanceFailed"
+	SpotConditionPreemptionScheduled   = "PreemptionScheduled"
 )
 
 var _ cloudprovider.CloudProvider = (*CloudProvider)(nil)
@@ -164,17 +164,9 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	if len(instanceTypes) == 0 {
 		return nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf("all requested instance types were unavailable during launch"))
 	}
-	if karpoptions.FromContext(ctx).FeatureGates.NodeOverlay {
-		if nodePoolName, ok := nodeClaim.Labels[karpv1.NodePoolLabelKey]; ok {
-			instanceTypes, err = c.instanceTypeStore.ApplyAll(nodePoolName, instanceTypes)
-			if err != nil {
-				return nil, fmt.Errorf("creating instance, %w", err)
-			}
-		}
-	}
 
 	// Choose provider based on provision mode
-	if options.FromContext(ctx).ProvisionMode == consts.ProvisionModeAKSMachineAPI {
+	if options.FromContext(ctx).IsAKSMachineAPIMode() {
 		return c.createAKSMachineInstance(ctx, nodeClass, nodeClaim, instanceTypes)
 	}
 
@@ -184,7 +176,7 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 func (c *CloudProvider) createVMInstance(ctx context.Context, nodeClass *v1beta1.AKSNodeClass, nodeClaim *karpv1.NodeClaim, instanceTypes []*cloudprovider.InstanceType) (*karpv1.NodeClaim, error) {
 	vmPromise, err := c.vmInstanceProvider.BeginCreate(ctx, nodeClass, nodeClaim, instanceTypes)
 	if err != nil {
-		return nil, cloudprovider.NewCreateError(fmt.Errorf("creating instance failed, %w", err), CreateInstanceFailedReason, truncateMessage(err.Error()))
+		return nil, toCreateError(err, "creating instance failed")
 	}
 
 	if err := c.handleInstancePromise(ctx, vmPromise, nodeClaim); err != nil {
@@ -218,7 +210,7 @@ func (c *CloudProvider) createAKSMachineInstance(ctx context.Context, nodeClass 
 	// Begin the creation of the instance
 	aksMachinePromise, err := c.aksMachineInstanceProvider.BeginCreate(ctx, nodeClass, nodeClaim, instanceTypes)
 	if err != nil {
-		return nil, cloudprovider.NewCreateError(fmt.Errorf("creating AKS machine failed, %w", err), CreateInstanceFailedReason, truncateMessage(err.Error()))
+		return nil, toCreateError(err, "creating AKS machine failed")
 	}
 
 	// Handle the promise
@@ -235,7 +227,8 @@ func (c *CloudProvider) createAKSMachineInstance(ctx context.Context, nodeClass 
 		aksMachinePromise.AKSMachineID,
 		aksMachinePromise.VMResourceID,
 		false,
-		aksMachinePromise.AKSMachineNodeImageVersion)
+		aksMachinePromise.AKSMachineNodeImageVersion,
+		aksMachinePromise.CreationTimestamp)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build NodeClaim from AKS machine template, %w", err)
 	}
@@ -265,7 +258,7 @@ func (c *CloudProvider) handleInstancePromise(ctx context.Context, instancePromi
 		err := instancePromise.Wait()
 		if err != nil {
 			c.handleInstancePromiseWaitError(ctx, instancePromise, nodeClaim, err)
-			return cloudprovider.NewCreateError(fmt.Errorf("creating standalone instance failed, %w", err), CreateInstanceFailedReason, truncateMessage(err.Error()))
+			return toCreateError(err, "creating standalone instance failed")
 		}
 	}
 	// For NodePool-managed nodeclaims, launch a single goroutine to poll the returned promise.
@@ -550,6 +543,16 @@ func (c *CloudProvider) RepairPolicies() []cloudprovider.RepairPolicy {
 			ConditionStatus:    corev1.ConditionFalse,
 			TolerationDuration: 0,
 		},
+		// Fast-path repair for Azure Spot VMs that received a platform eviction signal.
+		// The condition is emitted by a node-level agent that polls the Instance Metadata
+		// Service for SpotRebalanceRecommendation / Preempt events. Spot eviction notice
+		// is ~30s, so toleration is 0 — we want to start the replacement immediately
+		// rather than waiting for the NodeReady=Unknown 10-minute backstop.
+		{
+			ConditionType:      SpotConditionPreemptionScheduled,
+			ConditionStatus:    corev1.ConditionTrue,
+			TolerationDuration: 0,
+		},
 	}
 }
 
@@ -571,6 +574,14 @@ func (c *CloudProvider) resolveInstanceTypes(ctx context.Context, nodeClaim *kar
 	instanceTypes, err := c.instanceTypeProvider.List(ctx, nodeClass)
 	if err != nil {
 		return nil, fmt.Errorf("getting instance types, %w", err)
+	}
+	if karpoptions.FromContext(ctx).FeatureGates.NodeOverlay {
+		if nodePoolName, ok := nodeClaim.Labels[karpv1.NodePoolLabelKey]; ok {
+			instanceTypes, err = c.instanceTypeStore.ApplyAll(nodePoolName, instanceTypes)
+			if err != nil {
+				return nil, fmt.Errorf("applying instance type overlays, %w", err)
+			}
+		}
 	}
 
 	reqs := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)
@@ -634,14 +645,17 @@ func (c *CloudProvider) vmInstanceToNodeClaim(ctx context.Context, vm *armcomput
 		nodeClaim.Status.Allocatable = lo.PickBy(instanceType.Allocatable(), func(_ corev1.ResourceName, v resource.Quantity) bool { return !resources.IsZero(v) })
 	}
 
-	if zone, err := utils.MakeAKSLabelZoneFromVM(vm); err != nil {
-		log.FromContext(ctx).Info("failed to get zone for VM, zone label will be empty", "vmName", *vm.Name, "error", err)
+	if zone, err := zones.MakeAKSLabelZoneFromVM(vm); err != nil {
+		log.FromContext(ctx).Info("failed to get zone for VM", "vmName", *vm.Name, "error", err)
 	} else {
 		labels[corev1.LabelTopologyZone] = zone
+		labels[v1beta1.LabelPlacementScope] = zones.PlacementScopeForZone(zone)
 	}
 
 	labels[karpv1.CapacityTypeLabelKey] = instance.GetCapacityTypeFromVM(vm)
 	labels[v1beta1.AKSLabelScaleSetPriority] = instance.GetScaleSetPriorityLabelFromVM(vm)
+	labels[v1beta1.AKSLabelPriority] = instance.GetPriorityLabelFromVM(vm)
+	labels[v1beta1.LabelUltraSSD] = fmt.Sprint(instance.GetUltraSSDEnabled(vm))
 
 	if tag, ok := vm.Tags[launchtemplate.NodePoolTagKey]; ok {
 		labels[karpv1.NodePoolLabelKey] = *tag
@@ -690,6 +704,22 @@ func truncateMessage(msg string) string {
 		return msg
 	}
 	return msg[:truncateAt] + "..."
+}
+
+// toCreateError wraps an instance-create failure as a *cloudprovider.CreateError with the
+// wrapMsg context prefix. When err carries a classified CreateError (set by the offerings
+// error handlers, e.g. SKUNotAvailable or ZonalAllocationFailure), its specific Launched
+// condition reason and message are surfaced so consumers can branch on the cause; otherwise
+// it falls back to the generic CreateInstanceFailed reason and error text, preserving prior
+// behavior.
+func toCreateError(err error, wrapMsg string) error {
+	reason := CreateInstanceFailedReason
+	message := err.Error()
+	if classified, ok := stderrors.AsType[*cloudprovider.CreateError](err); ok {
+		reason = classified.ConditionReason
+		message = classified.ConditionMessage
+	}
+	return cloudprovider.NewCreateError(fmt.Errorf("%s, %w", wrapMsg, err), reason, truncateMessage(message))
 }
 
 func setAdditionalAnnotationsForNewNodeClaim(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1beta1.AKSNodeClass) error {

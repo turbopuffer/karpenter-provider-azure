@@ -19,7 +19,7 @@ package fake
 import (
 	"context"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v8"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v9"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily/types"
 	"github.com/samber/lo"
@@ -81,6 +81,12 @@ var (
 			OS:       lo.ToPtr("AKSUbuntu"),
 			SKU:      lo.ToPtr("2204gen2TLcontainerd"),
 			Version:  lo.ToPtr("202512.18.0"),
+		},
+		{
+			FullName: new("AKSUbuntu-2204gen2fipsTLcontainerd-202512.18.0"),
+			OS:       new("AKSUbuntu"),
+			SKU:      new("2204gen2fipsTLcontainerd"),
+			Version:  new("202512.18.0"),
 		},
 		{
 			FullName: lo.ToPtr("AKSUbuntuEdgeZone-2204containerd-202512.18.0"),

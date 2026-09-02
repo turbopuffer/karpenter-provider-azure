@@ -11,7 +11,8 @@ ifeq ($(CODESPACES),true)
   AZURE_RESOURCE_GROUP ?= $(CODESPACE_NAME)
   AZURE_ACR_NAME ?= $(subst -,,$(CODESPACE_NAME))
 else
-  NAME_SUFFIX ?= $(shell git config user.email | cut -d'@' -f1 | tr -d '+')
+  # generate a unique suffix based on the user's email
+  NAME_SUFFIX ?= $(shell git config user.email | cut -d'@' -f1 | tr -cd '[:alnum:]')
   AZURE_RESOURCE_GROUP ?= $(COMMON_NAME)$(NAME_SUFFIX)
   AZURE_ACR_NAME ?= $(COMMON_NAME)$(NAME_SUFFIX)
 endif
@@ -31,14 +32,19 @@ CUSTOM_SUBNET_NAME ?= nodesubnet
 
 PROVISION_MODE ?= aksscriptless
 AKS_MACHINES_POOL_NAME ?= testmpool
+# pre-pull base images for skaffold/ko build, as a workaround for https://github.com/GoogleContainerTools/skaffold/issues/10106
+KO_BASE_IMAGE ?= mcr.microsoft.com/azurelinux/distroless/base:3.0@sha256:178f25fadf466549d31e234b3091bf815161159f2f2bc98720bbf39f7368aff4
+KO_BASE_IMAGE_AMD64 ?= mcr.microsoft.com/azurelinux/distroless/base@sha256:d36923fbe5d85f981d84855f450d539017cb1005767f3f472f7b83d0d31a5c1a
+KO_BASE_IMAGE_ARM64 ?= mcr.microsoft.com/azurelinux/distroless/base@sha256:02ae850a01c91d6583334d6b337a6de8c087ad3d19da0e9781018e768af6784f
+export KOCACHE ?= $(or $(RUNNER_TEMP),/tmp)/ko-cache
 
 .DEFAULT_GOAL := help	# make without arguments will show help
 
 export KO_GO_PATH ?= hack/go-crossbuild.sh
 
 AZ_ALL_PERMS := az-perm az-perm-acr
-ifeq ($(PROVISION_MODE),aksmachineapi)
-  $(info PROVISION_MODE is aksmachineapi)
+ifneq ($(filter aksmachineapi aksmachineapiheaderbatch,$(PROVISION_MODE)),)
+  $(info PROVISION_MODE is $(PROVISION_MODE) (AKS Machine API mode))
   AZ_ALL_PERMS += az-perm-aksmachine az-add-aksmachinespool
 endif
 
@@ -58,7 +64,6 @@ az-all-perftest:     az-login az-create-workload-msi az-mkaks-perftest          
 	yq -i '.manifests.helm.releases[0].overrides.controller.resources.requests = {"cpu":4,"memory":"3Gi"}' skaffold.yaml
 	yq -i '.manifests.helm.releases[0].overrides.controller.resources.limits   = {"cpu":4,"memory":"3Gi"}' skaffold.yaml
 	$(MAKE) az-run
-	$(MAKE) az-taintsystemnodes
 	kubectl apply -f examples/v1/perftest.yaml
 	kubectl apply -f examples/workloads/inflate.yaml
 	# make az-mon-access
@@ -95,22 +100,18 @@ az-cleanup: ## Delete the deployment
 	skaffold delete || true
 
 az-e2etests: az-cleanenv ## Run e2etests
-	$(MAKE) az-taintnodes
 	AZURE_SUBSCRIPTION_ID=$(AZURE_SUBSCRIPTION_ID) \
 	AZURE_CLUSTER_NAME=$(AZURE_CLUSTER_NAME) \
 	AZURE_RESOURCE_GROUP=$(AZURE_RESOURCE_GROUP) \
 	AZURE_ACR_NAME=$(AZURE_ACR_NAME) \
 	$(MAKE) e2etests
-	$(MAKE) az-untaintnodes
 
 az-upstream-e2etests: az-cleanenv ## Run upstream e2etests
-	$(MAKE) az-taintnodes
 	AZURE_SUBSCRIPTION_ID=$(AZURE_SUBSCRIPTION_ID) \
 	AZURE_CLUSTER_NAME=$(AZURE_CLUSTER_NAME) \
 	AZURE_RESOURCE_GROUP=$(AZURE_RESOURCE_GROUP) \
 	AZURE_ACR_NAME=$(AZURE_ACR_NAME) \
 	$(MAKE) upstream-e2etests
-	$(MAKE) az-untaintnodes
 
 # ---------------------------------------------
 # CI targets (intended for use in CI pipelines)
@@ -156,7 +157,7 @@ az-mkaks: az-mkacr ## Create test AKS cluster (with --vm-set-type AvailabilitySe
 	EXIT_CODE=$$?; \
 	if [ $$EXIT_CODE -eq 1 ]; then \
 		az aks create --name $(AZURE_CLUSTER_NAME) --resource-group $(AZURE_RESOURCE_GROUP) --attach-acr $(AZURE_ACR_NAME) --location $(AZURE_LOCATION) \
-			--enable-managed-identity --node-count 3 --generate-ssh-keys --vm-set-type AvailabilitySet --output none \
+			--enable-managed-identity --node-count 3 --generate-ssh-keys --vm-set-type AvailabilitySet \
 			$(if $(AZURE_VM_SIZE),--node-vm-size $(AZURE_VM_SIZE)) \
 			$(if $(K8S_VERSION),--kubernetes-version $(K8S_VERSION)) \
 			--tags "make-command=az-mkaks"; \
@@ -171,7 +172,7 @@ az-mkaks-cniv1: az-mkacr ## Create test AKS cluster (with --network-plugin azure
 	EXIT_CODE=$$?; \
 	if [ $$EXIT_CODE -eq 1 ]; then \
 		az aks create --name $(AZURE_CLUSTER_NAME) --resource-group $(AZURE_RESOURCE_GROUP) --attach-acr $(AZURE_ACR_NAME) \
-			--enable-managed-identity --node-count 3 --generate-ssh-keys --output none --network-plugin azure \
+			--enable-managed-identity --node-count 3 --generate-ssh-keys --network-plugin azure \
 			--enable-oidc-issuer --enable-workload-identity --nodepool-taints "CriticalAddonsOnly=true:NoSchedule" \
 			$(if $(AZURE_VM_SIZE),--node-vm-size $(AZURE_VM_SIZE)) \
 			$(if $(K8S_VERSION),--kubernetes-version $(K8S_VERSION)) \
@@ -187,7 +188,7 @@ az-mkaks-cilium: az-mkacr ## Create test AKS cluster (with --network-dataplane c
 	EXIT_CODE=$$?; \
 	if [ $$EXIT_CODE -eq 1 ]; then \
 		az aks create --name $(AZURE_CLUSTER_NAME) --resource-group $(AZURE_RESOURCE_GROUP) --attach-acr $(AZURE_ACR_NAME) \
-			--enable-managed-identity --node-count 3 --generate-ssh-keys --output none \
+			--enable-managed-identity --node-count 3 --generate-ssh-keys \
 			--network-dataplane cilium --network-plugin azure --network-plugin-mode overlay \
 			--enable-oidc-issuer --enable-workload-identity --nodepool-taints "CriticalAddonsOnly=true:NoSchedule" \
 			$(if $(AZURE_VM_SIZE),--node-vm-size $(AZURE_VM_SIZE)) \
@@ -205,7 +206,7 @@ az-mkaks-cilium-userassigned: az-mkacr az-create-workload-msi ## Create test AKS
 	if [ $$EXIT_CODE -eq 1 ]; then \
 		KARPENTER_USER_ASSIGNED_IDENTITY_ID=$$(az identity show --resource-group $(AZURE_RESOURCE_GROUP) --name $(AZURE_KARPENTER_USER_ASSIGNED_IDENTITY_NAME) --query 'id' --output tsv); \
 		az aks create --name $(AZURE_CLUSTER_NAME) --resource-group $(AZURE_RESOURCE_GROUP) --attach-acr $(AZURE_ACR_NAME) \
-			--assign-identity $$KARPENTER_USER_ASSIGNED_IDENTITY_ID --node-count 3 --generate-ssh-keys --output none --network-dataplane cilium --network-plugin azure --network-plugin-mode overlay \
+			--assign-identity $$KARPENTER_USER_ASSIGNED_IDENTITY_ID --node-count 3 --generate-ssh-keys --network-dataplane cilium --network-plugin azure --network-plugin-mode overlay \
 			--enable-oidc-issuer --enable-workload-identity --nodepool-taints "CriticalAddonsOnly=true:NoSchedule" \
 			$(if $(AZURE_VM_SIZE),--node-vm-size $(AZURE_VM_SIZE),) \
 			$(if $(K8S_VERSION),--kubernetes-version $(K8S_VERSION)) \
@@ -221,7 +222,7 @@ az-mkaks-overlay: az-mkacr ## Create test AKS cluster (with --network-plugin-mod
 	EXIT_CODE=$$?; \
 	if [ $$EXIT_CODE -eq 1 ]; then \
 		az aks create --name $(AZURE_CLUSTER_NAME) --resource-group $(AZURE_RESOURCE_GROUP) --attach-acr $(AZURE_ACR_NAME) \
-			--enable-managed-identity --node-count 3 --generate-ssh-keys --output none \
+			--enable-managed-identity --node-count 3 --generate-ssh-keys \
 			--network-plugin azure --network-plugin-mode overlay \
 			--enable-oidc-issuer --enable-workload-identity --nodepool-taints "CriticalAddonsOnly=true:NoSchedule" \
 			$(if $(AZURE_VM_SIZE),--node-vm-size $(AZURE_VM_SIZE)) \
@@ -238,7 +239,7 @@ az-mkaks-perftest: az-mkacr ## Create test AKS cluster (with Azure Overlay, larg
 	EXIT_CODE=$$?; \
 	if [ $$EXIT_CODE -eq 1 ]; then \
 		az aks create --name $(AZURE_CLUSTER_NAME) --resource-group $(AZURE_RESOURCE_GROUP) --attach-acr $(AZURE_ACR_NAME) \
-			--enable-managed-identity --node-count 2 --generate-ssh-keys --output none \
+			--enable-managed-identity --node-count 2 --generate-ssh-keys \
 			--network-plugin azure --network-plugin-mode overlay \
 			--enable-oidc-issuer --enable-workload-identity --nodepool-taints "CriticalAddonsOnly=true:NoSchedule" \
 			--node-vm-size $(if $(AZURE_VM_SIZE),$(AZURE_VM_SIZE),Standard_D16s_v6) --pod-cidr "10.128.0.0/11" \
@@ -261,7 +262,7 @@ az-mkaks-custom-vnet: az-mkacr az-mkvnet az-mksubnet ## Create test AKS cluster 
 	EXIT_CODE=$$?; \
 	if [ $$EXIT_CODE -eq 1 ]; then \
 		az aks create --name $(AZURE_CLUSTER_NAME) --resource-group $(AZURE_RESOURCE_GROUP) --attach-acr $(AZURE_ACR_NAME) \
-			--enable-managed-identity --node-count 3 --generate-ssh-keys --output none \
+			--enable-managed-identity --node-count 3 --generate-ssh-keys \
 			--network-dataplane cilium --network-plugin azure --network-plugin-mode overlay \
 			--enable-oidc-issuer --enable-workload-identity --nodepool-taints "CriticalAddonsOnly=true:NoSchedule" \
 			$(if $(AZURE_VM_SIZE),--node-vm-size $(AZURE_VM_SIZE)) \
@@ -292,7 +293,7 @@ az-mkaks-savm: az-mkrg ## Create experimental cluster with standalone VMs (+ ACR
 az-add-aksmachinespool:
 	hack/deploy/add-aks-machines-pool.sh $(AZURE_SUBSCRIPTION_ID) $(AZURE_RESOURCE_GROUP) $(AZURE_CLUSTER_NAME) $(AKS_MACHINES_POOL_NAME)
 
-az-configure-values:  ## Generate cluster-related values for Karpenter Helm chart. Use PROVISION_MODE=aksmachineapi for AKS machine API mode.
+az-configure-values:  ## Generate cluster-related values for Karpenter Helm chart. Use PROVISION_MODE=aksmachineapi or aksmachineapiheaderbatch for AKS machine API modes.
 	LOG_LEVEL=debug hack/deploy/configure-values.sh $(AZURE_CLUSTER_NAME) $(AZURE_RESOURCE_GROUP) $(KARPENTER_SERVICE_ACCOUNT_NAME) $(AZURE_KARPENTER_USER_ASSIGNED_IDENTITY_NAME) $(ENABLE_AZURE_SDK_LOGGING) $(PROVISION_MODE) $(AKS_MACHINES_POOL_NAME)
 
 az-mkvmssflex: ## Create VMSS Flex (optional, only if creating VMs referencing this VMSS)
@@ -344,6 +345,7 @@ az-aks-check-acr:
 
 az-build: ## Build the Karpenter controller and webhook images using skaffold build (which uses ko build)
 	az acr login -n $(AZURE_ACR_NAME)
+	$(MAKE) az-ko-prewarm-base
 	skaffold build
 
 az-build-fips: ## Build the FIPS 140-3 variant of the controller image (controller-fips)
@@ -361,6 +363,12 @@ az-release: ## Build controller + controller-fips for the current commit, push t
 
 az-mirror-gar: ## Copy already-built controller images for a tag from turbopuffer ACR to GAR (TAG=... to override, default: current commit)
 	hack/mirror-gar.sh $(TAG)
+
+az-ko-prewarm-base: ## Prewarm ko's base image cache for skaffold/ko builds
+	mkdir -p $(KOCACHE)
+	crane pull --format=oci $(KO_BASE_IMAGE) $(KOCACHE)/img
+	crane pull --format=oci $(KO_BASE_IMAGE_AMD64) $(KOCACHE)/img
+	crane pull --format=oci $(KO_BASE_IMAGE_ARM64) $(KOCACHE)/img
 
 az-creds: ## Get cluster credentials
 	az aks get-credentials --name $(AZURE_CLUSTER_NAME) --resource-group $(AZURE_RESOURCE_GROUP) --overwrite-existing
@@ -388,18 +396,20 @@ az-mon-deploy: ## Deploy monitoring stack (w/o node-exporter)
 	helm repo add grafana-charts https://grafana.github.io/helm-charts
 	helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
 	helm repo update
-	kubectl create namespace monitoring || true
-	helm install --namespace monitoring prometheus prometheus-community/prometheus \
+	# Create the namespace if not extant; NOP otherwise
+	kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+	# We use `helm upgrade --install` to avoid errors if the release already exists, and to allow for upgrades of the release if it does exist.
+	helm upgrade --install --namespace monitoring prometheus prometheus-community/prometheus \
 		--values hack/monitoring/prometheus-values.yaml
-	helm install --namespace monitoring pyroscope grafana-charts/pyroscope \
+	helm upgrade --install --namespace monitoring pyroscope grafana-charts/pyroscope \
 		--set pyroscope.extraArgs.'usage-stats\.enabled'=false
-	helm install --namespace monitoring grafana grafana-charts/grafana \
+	helm upgrade --install --namespace monitoring grafana grafana-charts/grafana \
 		--values hack/monitoring/grafana-values.yaml \
 		--set env.GF_AUTH_ANONYMOUS_ENABLED=true \
 		--set env.GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
 
 az-mon-access: ## Get Grafana admin password and forward port
-	@echo Consider running port forward outside of codespace ...
+	@echo "Consider running port forward outside of codespace ..."
 	$(eval POD_NAME=$(shell kubectl get pods --namespace monitoring -l "app.kubernetes.io/name=grafana,app.kubernetes.io/instance=grafana" -o jsonpath="{.items[0].metadata.name}"))
 	kubectl port-forward --namespace monitoring $(POD_NAME) 3000
 
@@ -435,16 +445,6 @@ az-rmnodeclasses-fin: ## Remove Karpenter finalizer from all nodeclasses (use wi
 
 az-rmnodeclaims: ## kubectl delete all nodeclaims; don't wait for finalizers (use with care!)
 	kubectl delete --wait=false nodeclaims --all
-
-az-taintsystemnodes: ## Taint all system nodepool nodes
-	kubectl taint nodes CriticalAddonsOnly=true:NoSchedule --selector='kubernetes.azure.com/mode=system' --overwrite
-az-untaintsystemnodes: ## Untaint all system nodepool nodes
-	kubectl taint nodes CriticalAddonsOnly=true:NoSchedule- --selector='kubernetes.azure.com/mode=system' --overwrite
-
-az-taintnodes:
-	kubectl taint nodes CriticalAddonsOnly=true:NoSchedule --all --overwrite
-az-untaintnodes:
-	kubectl taint nodes CriticalAddonsOnly=true:NoSchedule- --all --overwrite
 
 az-perftest1: ## Test scaling out/in (1 VM)
 	hack/azure/perftest.sh 1

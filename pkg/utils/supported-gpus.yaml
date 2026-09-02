@@ -1,13 +1,13 @@
 #  StandardNCADSA10v4Family:
 standard_nc16ads_a10_v4:
   gpu: nvidia
-  os: ["ubuntu", "windows"]
+  os: ["ubuntu", "windows", "azurelinux3"]
 standard_nc32ads_a10_v4:
   gpu: nvidia
-  os: ["ubuntu", "windows"]
+  os: ["ubuntu", "windows", "azurelinux3"]
 standard_nc8ads_a10_v4:
   gpu: nvidia
-  os: ["ubuntu", "windows"]
+  os: ["ubuntu", "windows", "azurelinux3"]
 
 #  StandardNCADSA100v4Family:
 standard_nc24ads_a100_v4:
@@ -56,22 +56,22 @@ standard_nd120asr_a100_v4:
 #  StandardNVADSA10v5Family:
 standard_nv12ads_a10_v5:
   gpu: nvidia
-  os: ["ubuntu", "windows"]
+  os: ["ubuntu", "windows", "azurelinux3"]
 standard_nv18ads_a10_v5:
   gpu: nvidia
-  os: ["ubuntu", "windows"]
+  os: ["ubuntu", "windows", "azurelinux3"]
 standard_nv36adms_a10_v5:
   gpu: nvidia
-  os: ["ubuntu", "windows"]
+  os: ["ubuntu", "windows", "azurelinux3"]
 standard_nv36ads_a10_v5:
   gpu: nvidia
-  os: ["ubuntu", "windows"]
+  os: ["ubuntu", "windows", "azurelinux3"]
 standard_nv6ads_a10_v5:
   gpu: nvidia
-  os: ["ubuntu", "windows"]
+  os: ["ubuntu", "windows", "azurelinux3"]
 standard_nv72ads_a10_v5:
   gpu: nvidia
-  os: ["ubuntu", "windows"]
+  os: ["ubuntu", "windows", "azurelinux3"]
 
 #  standardNCFamily:
 standard_nc6:
@@ -265,27 +265,56 @@ standard_nd128isr_gb300_v6:
   gpu: nvidia
   os: ["ubuntu"]
 
+# StandardNCRTXPRO6000BSEv6Family:
+standard_nc24lds_xl_rtxpro6000bse_v6:
+  gpu: nvidia
+  os: ["ubuntu"]
+standard_nc36ds_xl_rtxpro6000bse_v6:
+  gpu: nvidia
+  os: ["ubuntu"]
+standard_nc36lds_xl_rtxpro6000bse_v6:
+  gpu: nvidia
+  os: ["ubuntu"]
+standard_nc72ds_xl_rtxpro6000bse_v6:
+  gpu: nvidia
+  os: ["ubuntu"]
+standard_nc72lds_xl_rtxpro6000bse_v6:
+  gpu: nvidia
+  os: ["ubuntu"]
+standard_nc144ds_xl_rtxpro6000bse_v6:
+  gpu: nvidia
+  os: ["ubuntu"]
+standard_nc144lds_xl_rtxpro6000bse_v6:
+  gpu: nvidia
+  os: ["ubuntu"]
+standard_nc288ds_xl_rtxpro6000bse_v6:
+  gpu: nvidia
+  os: ["ubuntu"]
+standard_nc288lds_xl_rtxpro6000bse_v6:
+  gpu: nvidia
+  os: ["ubuntu"]
+
 # NVads V710 v5-series (AMD GPU)
-# standard_nv4ads_v710_v5:
-#   gpu: amd
-#   os: ["ubuntu"]
-# standard_nv8ads_v710_v5:
-#   gpu: amd
-#   os: ["ubuntu"]
-# standard_nv12ads_v710_v5:
-#   gpu: amd
-#   os: ["ubuntu"]
-# standard_nv24ads_v710_v5:
-#   gpu: amd
-#   os: ["ubuntu"]
-# standard_nv28adms_v710_v5:
-#   gpu: amd
-#   os: ["ubuntu"]
+standard_nv4ads_v710_v5:
+  gpu: amd
+  os: ["ubuntu"]
+standard_nv8ads_v710_v5:
+  gpu: amd
+  os: ["ubuntu"]
+standard_nv12ads_v710_v5:
+  gpu: amd
+  os: ["ubuntu"]
+standard_nv24ads_v710_v5:
+  gpu: amd
+  os: ["ubuntu"]
+standard_nv28adms_v710_v5:
+  gpu: amd
+  os: ["ubuntu"]
 
 # ND-MI300X-v5 series (AMD GPU)
-# standard_nd96isr_mi300x_v5:
-#   gpu: amd
-#   os: ["ubuntu"]
-# standard_nd96is_mi300x_v5:
-#   gpu: amd
-#   os: ["ubuntu"]
+standard_nd96isr_mi300x_v5:
+  gpu: amd
+  os: ["ubuntu"]
+standard_nd96is_mi300x_v5:
+  gpu: amd
+  os: ["ubuntu"]

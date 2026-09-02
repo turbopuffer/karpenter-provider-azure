@@ -28,6 +28,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	corecloudprovider "sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -37,7 +38,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v8"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v9"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 	"github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclass/status"
@@ -45,6 +46,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 	"github.com/Azure/karpenter-provider-azure/pkg/test"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
+	"github.com/Azure/karpenter-provider-azure/pkg/utils/zones"
 )
 
 func validateAKSMachineNodeClaim(nodeClaim *karpv1.NodeClaim, nodePool *karpv1.NodePool) {
@@ -134,6 +136,20 @@ func runSharedAKSMachineAPITests() {
 		Expect(azureEnv.AKSMachinesAPI.AKSMachineGetBehavior.CalledWithInput.Len()).To(Equal(1))
 		Expect(azureEnv.VirtualMachinesAPI.VirtualMachineGetBehavior.CalledWithInput.Len()).To(Equal(0)) // Should not be bothered
 		Expect(nodeClaim).To(BeNil())
+	})
+
+	runNodeOverlayCapacityTests(nodeOverlayCapacityTestOptions{
+		validateNodeClaim: func(nodeClaim *karpv1.NodeClaim) {
+			validateAKSMachineNodeClaim(nodeClaim, nodePool)
+		},
+		resetCreateCalls: func() {
+			azureEnv.AKSMachinesAPI.AKSMachineCreateOrUpdateBehavior.CalledWithInput.Reset()
+			azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Reset()
+		},
+		expectCreateCalls: func() {
+			Expect(azureEnv.AKSMachinesAPI.AKSMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(Equal(1))
+			Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(Equal(0))
+		},
 	})
 
 	// XPMT: TODO(comtalyst): deep inspection test on simulating all of these?
@@ -266,6 +282,12 @@ func runSharedAKSMachineAPITests() {
 		})
 
 		It("should handle AKS machine list failures - unrecognized error", func() {
+			if testOptions.ProvisionMode == consts.ProvisionModeAKSMachineAPIHeaderBatch {
+				// Under batch, List must work for PollUntilDone (provisioning) to complete.
+				// Testing "List fails" requires a batch-specific test that expects provisioning failure,
+				// not this test which assumes provisioning succeeds then List fails afterward.
+				Skip("Batch provisioning depends on List to work")
+			}
 			// Set up error to occur during the NextPage call
 			azureEnv.AKSMachinesAPI.AKSMachineNewListPagerBehavior.Error.Set(fake.AKSMachineAPIErrorAny)
 
@@ -345,18 +367,14 @@ func runSharedAKSMachineAPITests() {
 					},
 					Requirements: []karpv1.NodeSelectorRequirementWithMinValues{
 						{
-							NodeSelectorRequirement: v1.NodeSelectorRequirement{
-								Key:      v1.LabelTopologyZone,
-								Operator: v1.NodeSelectorOpIn,
-								Values:   []string{utils.MakeAKSLabelZoneFromARMZone(fake.Region, "1")},
-							},
+							Key:      v1.LabelTopologyZone,
+							Operator: v1.NodeSelectorOpIn,
+							Values:   []string{zones.MakeAKSLabelZoneFromARMZone(fake.Region, "1")},
 						},
 						{
-							NodeSelectorRequirement: v1.NodeSelectorRequirement{
-								Key:      v1.LabelInstanceTypeStable,
-								Operator: v1.NodeSelectorOpIn,
-								Values:   []string{"Standard_D2_v2"},
-							},
+							Key:      v1.LabelInstanceTypeStable,
+							Operator: v1.NodeSelectorOpIn,
+							Values:   []string{"Standard_D2_v2"},
 						},
 					},
 				},
@@ -382,17 +400,22 @@ func runSharedAKSMachineAPITests() {
 
 			// Verify the AKS machine was reused successfully
 			Expect(azureEnv.AKSMachinesAPI.AKSMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(Equal(0))
-			Expect(azureEnv.AKSMachinesAPI.AKSMachineGetBehavior.CalledWithInput.Len()).To(Equal(1))
+			// With cache enabled, the GET is served from cache rather than hitting the API directly.
+			if testOptions.ProvisionMode == consts.ProvisionModeAKSMachineAPIHeaderBatch {
+				// With cache enabled, the pre-create GET is served from cache — no API call recorded
+				Expect(azureEnv.AKSMachinesAPI.AKSMachineGetBehavior.CalledWithInput.Len()).To(Equal(0))
+			} else {
+				Expect(azureEnv.AKSMachinesAPI.AKSMachineGetBehavior.CalledWithInput.Len()).To(Equal(1))
+			}
 
-			// Since no new machine was created, get the machine that was retrieved via Get
-			getInput := azureEnv.AKSMachinesAPI.AKSMachineGetBehavior.CalledWithInput.Pop()
-			aksMachineName := getInput.AKSMachineName
+			// Since no new machine was created, verify the machine in the fake store matches original config.
+			aksMachineName := firstNodeClaim.Name
 
 			// Get the actual machine from the fake store
 			machineID := fake.MkMachineID(testOptions.NodeResourceGroup, testOptions.ClusterName, testOptions.AKSMachinesPoolName, aksMachineName)
 			existingMachine, ok := azureEnv.AKSDataStorage.AKSMachines.Load(machineID)
 			Expect(ok).To(BeTrue(), "AKS machine should exist in fake store")
-			aksMachine := existingMachine.(armcontainerservice.Machine)
+			aksMachine := existingMachine
 			Expect(aksMachine.Properties).ToNot(BeNil())
 
 			// Validate AKS machine properties match the conflicted configuration
@@ -404,7 +427,7 @@ func runSharedAKSMachineAPITests() {
 
 			// Validate the returned nodeClaim has correct configuration
 			validateAKSMachineNodeClaim(nodeClaim, nodePool)
-			Expect(nodeClaim.Labels[v1.LabelTopologyZone]).To(Equal(utils.MakeAKSLabelZoneFromARMZone(fake.Region, "1")))
+			Expect(nodeClaim.Labels[v1.LabelTopologyZone]).To(Equal(zones.MakeAKSLabelZoneFromARMZone(fake.Region, "1")))
 			Expect(nodeClaim.Labels[v1.LabelInstanceTypeStable]).To(Equal("Standard_D2_v2"))
 		})
 
@@ -422,18 +445,14 @@ func runSharedAKSMachineAPITests() {
 					},
 					Requirements: []karpv1.NodeSelectorRequirementWithMinValues{
 						{
-							NodeSelectorRequirement: v1.NodeSelectorRequirement{
-								Key:      v1.LabelTopologyZone,
-								Operator: v1.NodeSelectorOpIn,
-								Values:   []string{utils.MakeAKSLabelZoneFromARMZone(fake.Region, "1")},
-							},
+							Key:      v1.LabelTopologyZone,
+							Operator: v1.NodeSelectorOpIn,
+							Values:   []string{zones.MakeAKSLabelZoneFromARMZone(fake.Region, "1")},
 						},
 						{
-							NodeSelectorRequirement: v1.NodeSelectorRequirement{
-								Key:      v1.LabelInstanceTypeStable,
-								Operator: v1.NodeSelectorOpIn,
-								Values:   []string{"Standard_D2_v2"},
-							},
+							Key:      v1.LabelInstanceTypeStable,
+							Operator: v1.NodeSelectorOpIn,
+							Values:   []string{"Standard_D2_v2"},
 						},
 					},
 				},
@@ -452,6 +471,7 @@ func runSharedAKSMachineAPITests() {
 
 			// Simulate Get being faulty (or the previous machine comes into exist between get and create)
 			azureEnv.AKSMachinesAPI.AKSMachineGetBehavior.Error.Set(fake.AKSMachineAPIErrorFromAKSMachineNotFound)
+			azureEnv.AKSMachineCache.InvalidateAll() // Ensure the cache doesn't serve stale data
 
 			// Call cloudProvider.Create directly with the unconflicted nodeclaim to trigger empty create
 			azureEnv.AKSMachinesAPI.AKSMachineCreateOrUpdateBehavior.CalledWithInput.Reset()
@@ -474,7 +494,7 @@ func runSharedAKSMachineAPITests() {
 
 			// Validate the returned nodeClaim has correct configuration
 			validateAKSMachineNodeClaim(nodeClaim, nodePool)
-			Expect(nodeClaim.Labels[v1.LabelTopologyZone]).To(Equal(utils.MakeAKSLabelZoneFromARMZone(fake.Region, "1")))
+			Expect(nodeClaim.Labels[v1.LabelTopologyZone]).To(Equal(zones.MakeAKSLabelZoneFromARMZone(fake.Region, "1")))
 			Expect(nodeClaim.Labels[v1.LabelInstanceTypeStable]).To(Equal("Standard_D2_v2"))
 		})
 
@@ -492,18 +512,14 @@ func runSharedAKSMachineAPITests() {
 					},
 					Requirements: []karpv1.NodeSelectorRequirementWithMinValues{
 						{
-							NodeSelectorRequirement: v1.NodeSelectorRequirement{
-								Key:      v1.LabelTopologyZone,
-								Operator: v1.NodeSelectorOpIn,
-								Values:   []string{utils.MakeAKSLabelZoneFromARMZone(fake.Region, "1")},
-							},
+							Key:      v1.LabelTopologyZone,
+							Operator: v1.NodeSelectorOpIn,
+							Values:   []string{zones.MakeAKSLabelZoneFromARMZone(fake.Region, "1")},
 						},
 						{
-							NodeSelectorRequirement: v1.NodeSelectorRequirement{
-								Key:      v1.LabelInstanceTypeStable,
-								Operator: v1.NodeSelectorOpIn,
-								Values:   []string{"Standard_D2_v2"},
-							},
+							Key:      v1.LabelInstanceTypeStable,
+							Operator: v1.NodeSelectorOpIn,
+							Values:   []string{"Standard_D2_v2"},
 						},
 					},
 				},
@@ -522,23 +538,20 @@ func runSharedAKSMachineAPITests() {
 			// Change zone to create immutable configuration conflict
 			conflictedNodeClaim.Spec.Requirements = []karpv1.NodeSelectorRequirementWithMinValues{
 				{
-					NodeSelectorRequirement: v1.NodeSelectorRequirement{
-						Key:      v1.LabelTopologyZone,
-						Operator: v1.NodeSelectorOpIn,
-						Values:   []string{utils.MakeAKSLabelZoneFromARMZone(fake.Region, "2")}, // Different zone
-					},
+					Key:      v1.LabelTopologyZone,
+					Operator: v1.NodeSelectorOpIn,
+					Values:   []string{zones.MakeAKSLabelZoneFromARMZone(fake.Region, "2")}, // Different zone,
 				},
 				{
-					NodeSelectorRequirement: v1.NodeSelectorRequirement{
-						Key:      v1.LabelInstanceTypeStable,
-						Operator: v1.NodeSelectorOpIn,
-						Values:   []string{"Standard_D2_v5"}, // Different SKU
-					},
+					Key:      v1.LabelInstanceTypeStable,
+					Operator: v1.NodeSelectorOpIn,
+					Values:   []string{"Standard_D2_v5"}, // Different SKU,
 				},
 			}
 
 			// Simulate Get being faulty (or the previous machine comes into exist between get and create)
 			azureEnv.AKSMachinesAPI.AKSMachineGetBehavior.Error.Set(fake.AKSMachineAPIErrorFromAKSMachineNotFound)
+			azureEnv.AKSMachineCache.InvalidateAll() // Ensure the cache doesn't serve stale data
 
 			// Call cloudProvider.Create directly with the conflicted nodeclaim to trigger the race condition
 			// This targets the same machine name but should fail due to configuration conflict and trigger cleanup
@@ -572,7 +585,7 @@ func runSharedAKSMachineAPITests() {
 
 			// Validate the returned nodeClaim has correct configuration
 			validateAKSMachineNodeClaim(createdConflictedNodeClaim, nodePool)
-			Expect(createdConflictedNodeClaim.Labels[v1.LabelTopologyZone]).To(Equal(utils.MakeAKSLabelZoneFromARMZone(fake.Region, "2")))
+			Expect(createdConflictedNodeClaim.Labels[v1.LabelTopologyZone]).To(Equal(zones.MakeAKSLabelZoneFromARMZone(fake.Region, "2")))
 			Expect(createdConflictedNodeClaim.Labels[v1.LabelInstanceTypeStable]).To(Equal("Standard_D2_v5"))
 			Expect(createdConflictedNodeClaim.CreationTimestamp).ToNot(BeZero())
 		})
@@ -580,10 +593,10 @@ func runSharedAKSMachineAPITests() {
 }
 
 var _ = Describe("CloudProvider", func() {
-	Context("ProvisionMode = AKSMachineAPI, ManageExistingAKSMachines = false", func() {
+	Context("ProvisionMode = AKSMachineAPIHeaderBatch, ManageExistingAKSMachines = false", func() {
 		BeforeEach(func() {
 			testOptions = test.Options(test.OptionsFields{
-				ProvisionMode:             lo.ToPtr(consts.ProvisionModeAKSMachineAPI),
+				ProvisionMode:             lo.ToPtr(consts.ProvisionModeAKSMachineAPIHeaderBatch),
 				UseSIG:                    lo.ToPtr(true),
 				ManageExistingAKSMachines: lo.ToPtr(false), // should not have any effect, as ProvisionMode is AKSMachineAPI
 			})
@@ -593,15 +606,15 @@ var _ = Describe("CloudProvider", func() {
 
 			azureEnv = test.NewEnvironment(ctx, env)
 			azureEnvNonZonal = test.NewEnvironmentNonZonal(ctx, env)
-			statusController = status.NewController(env.Client, azureEnv.KubernetesVersionProvider, azureEnv.ImageProvider, env.KubernetesInterface, azureEnv.SubnetsAPI, azureEnv.DiskEncryptionSetsAPI, testOptions.ParsedDiskEncryptionSetID)
+			statusController = status.NewController(env.Client, azureEnv.KubernetesVersionProvider, azureEnv.ImageProvider, env.KubernetesInterface, env.KubernetesInterface, nil, azureEnv.SubnetsAPI, azureEnv.DiskEncryptionSetsAPI, testOptions.ParsedDiskEncryptionSetID, options.FromContext(ctx).NetworkPolicy, options.FromContext(ctx).NetworkPlugin)
 			test.ApplyDefaultStatus(nodeClass, env, testOptions.UseSIG)
 			cloudProvider = New(azureEnv.InstanceTypesProvider, azureEnv.VMInstanceProvider, azureEnv.AKSMachineProvider, recorder, env.Client, azureEnv.ImageProvider, azureEnv.InstanceTypeStore)
 			cloudProviderNonZonal = New(azureEnvNonZonal.InstanceTypesProvider, azureEnvNonZonal.VMInstanceProvider, azureEnvNonZonal.AKSMachineProvider, events.NewRecorder(&record.FakeRecorder{}), env.Client, azureEnvNonZonal.ImageProvider, azureEnvNonZonal.InstanceTypeStore)
 
 			cluster = state.NewCluster(fakeClock, env.Client, cloudProvider)
 			clusterNonZonal = state.NewCluster(fakeClock, env.Client, cloudProviderNonZonal)
-			coreProvisioner = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, fakeClock)
-			coreProvisionerNonZonal = provisioning.NewProvisioner(env.Client, recorder, cloudProviderNonZonal, clusterNonZonal, fakeClock)
+			coreProvisioner = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, fakeClock, deviceallocation.NewController(env.Client))
+			coreProvisionerNonZonal = provisioning.NewProvisioner(env.Client, recorder, cloudProviderNonZonal, clusterNonZonal, fakeClock, deviceallocation.NewController(env.Client))
 
 			ExpectApplied(ctx, env.Client, nodeClass, nodePool)
 			ExpectObjectReconciled(ctx, env.Client, statusController, nodeClass)
@@ -611,18 +624,18 @@ var _ = Describe("CloudProvider", func() {
 			// Wait for any async polling goroutines to complete before resetting
 			cloudProvider.WaitForInstancePromises()
 			cluster.Reset()
-			azureEnv.Reset()
-			azureEnvNonZonal.Reset()
+			azureEnv.Reset(ctx)
+			azureEnvNonZonal.Reset(ctx)
 		})
 
 		// Run shared AKS Machine API tests
 		runSharedAKSMachineAPITests()
 	})
 
-	Context("ProvisionMode = AKSMachineAPI, ManageExistingAKSMachines = true", func() {
+	Context("ProvisionMode = AKSMachineAPIHeaderBatch, ManageExistingAKSMachines = true", func() {
 		BeforeEach(func() {
 			testOptions = test.Options(test.OptionsFields{
-				ProvisionMode:             lo.ToPtr(consts.ProvisionModeAKSMachineAPI),
+				ProvisionMode:             lo.ToPtr(consts.ProvisionModeAKSMachineAPIHeaderBatch),
 				UseSIG:                    lo.ToPtr(true),
 				ManageExistingAKSMachines: lo.ToPtr(true), // should not have any effect
 			})
@@ -632,15 +645,15 @@ var _ = Describe("CloudProvider", func() {
 
 			azureEnv = test.NewEnvironment(ctx, env)
 			azureEnvNonZonal = test.NewEnvironmentNonZonal(ctx, env)
-			statusController = status.NewController(env.Client, azureEnv.KubernetesVersionProvider, azureEnv.ImageProvider, env.KubernetesInterface, azureEnv.SubnetsAPI, azureEnv.DiskEncryptionSetsAPI, testOptions.ParsedDiskEncryptionSetID)
+			statusController = status.NewController(env.Client, azureEnv.KubernetesVersionProvider, azureEnv.ImageProvider, env.KubernetesInterface, env.KubernetesInterface, nil, azureEnv.SubnetsAPI, azureEnv.DiskEncryptionSetsAPI, testOptions.ParsedDiskEncryptionSetID, options.FromContext(ctx).NetworkPolicy, options.FromContext(ctx).NetworkPlugin)
 			test.ApplyDefaultStatus(nodeClass, env, testOptions.UseSIG)
 			cloudProvider = New(azureEnv.InstanceTypesProvider, azureEnv.VMInstanceProvider, azureEnv.AKSMachineProvider, recorder, env.Client, azureEnv.ImageProvider, azureEnv.InstanceTypeStore)
 			cloudProviderNonZonal = New(azureEnvNonZonal.InstanceTypesProvider, azureEnvNonZonal.VMInstanceProvider, azureEnvNonZonal.AKSMachineProvider, events.NewRecorder(&record.FakeRecorder{}), env.Client, azureEnvNonZonal.ImageProvider, azureEnvNonZonal.InstanceTypeStore)
 
 			cluster = state.NewCluster(fakeClock, env.Client, cloudProvider)
 			clusterNonZonal = state.NewCluster(fakeClock, env.Client, cloudProviderNonZonal)
-			coreProvisioner = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, fakeClock)
-			coreProvisionerNonZonal = provisioning.NewProvisioner(env.Client, recorder, cloudProviderNonZonal, clusterNonZonal, fakeClock)
+			coreProvisioner = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, fakeClock, deviceallocation.NewController(env.Client))
+			coreProvisionerNonZonal = provisioning.NewProvisioner(env.Client, recorder, cloudProviderNonZonal, clusterNonZonal, fakeClock, deviceallocation.NewController(env.Client))
 
 			ExpectApplied(ctx, env.Client, nodeClass, nodePool)
 			ExpectObjectReconciled(ctx, env.Client, statusController, nodeClass)
@@ -650,15 +663,15 @@ var _ = Describe("CloudProvider", func() {
 			// Wait for any async polling goroutines to complete before resetting
 			cloudProvider.WaitForInstancePromises()
 			cluster.Reset()
-			azureEnv.Reset()
-			azureEnvNonZonal.Reset()
+			azureEnv.Reset(ctx)
+			azureEnvNonZonal.Reset(ctx)
 		})
 
 		// Run shared AKS Machine API tests
 		runSharedAKSMachineAPITests()
 	})
 
-	Context("Mixed Environment - Migration from ProvisionMode = AKSMachineAPI to VM mode", func() {
+	Context("Mixed Environment - Migration from ProvisionMode = AKSMachineAPIHeaderBatch to VM mode", func() {
 		Context("ManageExistingAKSMachines = false", func() {
 			var existingAKSMachine *armcontainerservice.Machine
 
@@ -674,15 +687,15 @@ var _ = Describe("CloudProvider", func() {
 
 				azureEnv = test.NewEnvironment(ctx, env)
 				azureEnvNonZonal = test.NewEnvironmentNonZonal(ctx, env)
-				statusController = status.NewController(env.Client, azureEnv.KubernetesVersionProvider, azureEnv.ImageProvider, env.KubernetesInterface, azureEnv.SubnetsAPI, azureEnv.DiskEncryptionSetsAPI, testOptions.ParsedDiskEncryptionSetID)
+				statusController = status.NewController(env.Client, azureEnv.KubernetesVersionProvider, azureEnv.ImageProvider, env.KubernetesInterface, env.KubernetesInterface, nil, azureEnv.SubnetsAPI, azureEnv.DiskEncryptionSetsAPI, testOptions.ParsedDiskEncryptionSetID, options.FromContext(ctx).NetworkPolicy, options.FromContext(ctx).NetworkPlugin)
 				test.ApplyDefaultStatus(nodeClass, env, testOptions.UseSIG)
 				cloudProvider = New(azureEnv.InstanceTypesProvider, azureEnv.VMInstanceProvider, azureEnv.AKSMachineProvider, recorder, env.Client, azureEnv.ImageProvider, azureEnv.InstanceTypeStore)
 				cloudProviderNonZonal = New(azureEnvNonZonal.InstanceTypesProvider, azureEnvNonZonal.VMInstanceProvider, azureEnvNonZonal.AKSMachineProvider, events.NewRecorder(&record.FakeRecorder{}), env.Client, azureEnvNonZonal.ImageProvider, azureEnvNonZonal.InstanceTypeStore)
 
 				cluster = state.NewCluster(fakeClock, env.Client, cloudProvider)
 				clusterNonZonal = state.NewCluster(fakeClock, env.Client, cloudProviderNonZonal)
-				coreProvisioner = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, fakeClock)
-				coreProvisionerNonZonal = provisioning.NewProvisioner(env.Client, recorder, cloudProviderNonZonal, clusterNonZonal, fakeClock)
+				coreProvisioner = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, fakeClock, deviceallocation.NewController(env.Client))
+				coreProvisionerNonZonal = provisioning.NewProvisioner(env.Client, recorder, cloudProviderNonZonal, clusterNonZonal, fakeClock, deviceallocation.NewController(env.Client))
 
 				ExpectApplied(ctx, env.Client, nodeClass, nodePool)
 				ExpectObjectReconciled(ctx, env.Client, statusController, nodeClass)
@@ -707,7 +720,7 @@ var _ = Describe("CloudProvider", func() {
 				// Wait for any async polling goroutines to complete before resetting
 				cloudProvider.WaitForInstancePromises()
 				cluster.Reset()
-				azureEnv.Reset()
+				azureEnv.Reset(ctx)
 			})
 
 			It("should handle basic operations - new nodes use VMs, existing AKS machines are still visible", func() {
@@ -805,15 +818,15 @@ var _ = Describe("CloudProvider", func() {
 
 				azureEnv = test.NewEnvironment(ctx, env)
 				azureEnvNonZonal = test.NewEnvironmentNonZonal(ctx, env)
-				statusController = status.NewController(env.Client, azureEnv.KubernetesVersionProvider, azureEnv.ImageProvider, env.KubernetesInterface, azureEnv.SubnetsAPI, azureEnv.DiskEncryptionSetsAPI, testOptions.ParsedDiskEncryptionSetID)
+				statusController = status.NewController(env.Client, azureEnv.KubernetesVersionProvider, azureEnv.ImageProvider, env.KubernetesInterface, env.KubernetesInterface, nil, azureEnv.SubnetsAPI, azureEnv.DiskEncryptionSetsAPI, testOptions.ParsedDiskEncryptionSetID, options.FromContext(ctx).NetworkPolicy, options.FromContext(ctx).NetworkPlugin)
 				test.ApplyDefaultStatus(nodeClass, env, testOptions.UseSIG)
 				cloudProvider = New(azureEnv.InstanceTypesProvider, azureEnv.VMInstanceProvider, azureEnv.AKSMachineProvider, recorder, env.Client, azureEnv.ImageProvider, azureEnv.InstanceTypeStore)
 				cloudProviderNonZonal = New(azureEnvNonZonal.InstanceTypesProvider, azureEnvNonZonal.VMInstanceProvider, azureEnvNonZonal.AKSMachineProvider, events.NewRecorder(&record.FakeRecorder{}), env.Client, azureEnvNonZonal.ImageProvider, azureEnvNonZonal.InstanceTypeStore)
 
 				cluster = state.NewCluster(fakeClock, env.Client, cloudProvider)
 				clusterNonZonal = state.NewCluster(fakeClock, env.Client, cloudProviderNonZonal)
-				coreProvisioner = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, fakeClock)
-				coreProvisionerNonZonal = provisioning.NewProvisioner(env.Client, recorder, cloudProviderNonZonal, clusterNonZonal, fakeClock)
+				coreProvisioner = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, fakeClock, deviceallocation.NewController(env.Client))
+				coreProvisionerNonZonal = provisioning.NewProvisioner(env.Client, recorder, cloudProviderNonZonal, clusterNonZonal, fakeClock, deviceallocation.NewController(env.Client))
 
 				ExpectApplied(ctx, env.Client, nodeClass, nodePool)
 				ExpectObjectReconciled(ctx, env.Client, statusController, nodeClass)
@@ -839,7 +852,7 @@ var _ = Describe("CloudProvider", func() {
 				// Wait for any async polling goroutines to complete before resetting
 				cloudProvider.WaitForInstancePromises()
 				cluster.Reset()
-				azureEnv.Reset()
+				azureEnv.Reset(ctx)
 			})
 
 			It("should handle basic operations - new nodes use VMs, existing AKS machines are still visible", func() {
@@ -1005,12 +1018,12 @@ var _ = Describe("CloudProvider", func() {
 		})
 	})
 
-	Context("Mixed Environment - Migration to ProvisionMode = AKSMachineAPI", func() {
+	Context("Mixed Environment - Migration to ProvisionMode = AKSMachineAPIHeaderBatch", func() {
 		var existingVM *armcompute.VirtualMachine
 
 		BeforeEach(func() {
 			testOptions = test.Options(test.OptionsFields{
-				ProvisionMode: lo.ToPtr(consts.ProvisionModeAKSMachineAPI),
+				ProvisionMode: lo.ToPtr(consts.ProvisionModeAKSMachineAPIHeaderBatch),
 				UseSIG:        lo.ToPtr(true),
 			})
 
@@ -1019,15 +1032,15 @@ var _ = Describe("CloudProvider", func() {
 
 			azureEnv = test.NewEnvironment(ctx, env)
 			azureEnvNonZonal = test.NewEnvironmentNonZonal(ctx, env)
-			statusController = status.NewController(env.Client, azureEnv.KubernetesVersionProvider, azureEnv.ImageProvider, env.KubernetesInterface, azureEnv.SubnetsAPI, azureEnv.DiskEncryptionSetsAPI, testOptions.ParsedDiskEncryptionSetID)
+			statusController = status.NewController(env.Client, azureEnv.KubernetesVersionProvider, azureEnv.ImageProvider, env.KubernetesInterface, env.KubernetesInterface, nil, azureEnv.SubnetsAPI, azureEnv.DiskEncryptionSetsAPI, testOptions.ParsedDiskEncryptionSetID, options.FromContext(ctx).NetworkPolicy, options.FromContext(ctx).NetworkPlugin)
 			test.ApplyDefaultStatus(nodeClass, env, testOptions.UseSIG)
 			cloudProvider = New(azureEnv.InstanceTypesProvider, azureEnv.VMInstanceProvider, azureEnv.AKSMachineProvider, recorder, env.Client, azureEnv.ImageProvider, azureEnv.InstanceTypeStore)
 			cloudProviderNonZonal = New(azureEnvNonZonal.InstanceTypesProvider, azureEnvNonZonal.VMInstanceProvider, azureEnvNonZonal.AKSMachineProvider, events.NewRecorder(&record.FakeRecorder{}), env.Client, azureEnvNonZonal.ImageProvider, azureEnvNonZonal.InstanceTypeStore)
 
 			cluster = state.NewCluster(fakeClock, env.Client, cloudProvider)
 			clusterNonZonal = state.NewCluster(fakeClock, env.Client, cloudProviderNonZonal)
-			coreProvisioner = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, fakeClock)
-			coreProvisionerNonZonal = provisioning.NewProvisioner(env.Client, recorder, cloudProviderNonZonal, clusterNonZonal, fakeClock)
+			coreProvisioner = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, fakeClock, deviceallocation.NewController(env.Client))
+			coreProvisionerNonZonal = provisioning.NewProvisioner(env.Client, recorder, cloudProviderNonZonal, clusterNonZonal, fakeClock, deviceallocation.NewController(env.Client))
 
 			ExpectApplied(ctx, env.Client, nodeClass, nodePool)
 			ExpectObjectReconciled(ctx, env.Client, statusController, nodeClass)
@@ -1040,7 +1053,7 @@ var _ = Describe("CloudProvider", func() {
 			// Wait for any async polling goroutines to complete before resetting
 			cloudProvider.WaitForInstancePromises()
 			cluster.Reset()
-			azureEnv.Reset()
+			azureEnv.Reset(ctx)
 		})
 
 		It("should be able to handle basic operations", func() {

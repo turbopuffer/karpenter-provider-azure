@@ -23,14 +23,14 @@ import (
 	"io"
 	"maps"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	"github.com/Azure/karpenter-provider-azure/pkg/auth"
-	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient"
+	fakesync "github.com/Azure/karpenter-provider-azure/pkg/fake/sync"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient/azapi"
 	"github.com/samber/lo"
 )
 
@@ -65,15 +65,15 @@ type VirtualMachinesBehavior struct {
 	VirtualMachineUpdateBehavior         MockedLRO[VirtualMachineUpdateInput, armcompute.VirtualMachinesClientUpdateResponse]
 	VirtualMachineDeleteBehavior         MockedLRO[VirtualMachineDeleteInput, armcompute.VirtualMachinesClientDeleteResponse]
 	VirtualMachineGetBehavior            MockedFunction[VirtualMachineGetInput, armcompute.VirtualMachinesClientGetResponse]
-	Instances                            sync.Map
+	Instances                            fakesync.Map[string, armcompute.VirtualMachine]
 }
 
 // assert that the fake implements the interface
-var _ azclient.VirtualMachinesAPI = &VirtualMachinesAPI{}
+var _ azapi.VirtualMachinesAPI = &VirtualMachinesAPI{}
 
 type VirtualMachinesAPI struct {
 	// TODO: document the implications of embedding vs. not embedding the interface here
-	// azclient.VirtualMachinesAPI // - this is the interface we are mocking.
+	// azapi.VirtualMachinesAPI // - this is the interface we are mocking.
 	VirtualMachinesBehavior
 	AuxiliaryTokenPolicy *auth.AuxiliaryTokenPolicy
 }
@@ -84,10 +84,7 @@ func (c *VirtualMachinesAPI) Reset() {
 	c.VirtualMachineDeleteBehavior.Reset()
 	c.VirtualMachineGetBehavior.Reset()
 	c.VirtualMachineUpdateBehavior.Reset()
-	c.Instances.Range(func(k, v any) bool {
-		c.Instances.Delete(k)
-		return true
-	})
+	c.Instances.Clear()
 }
 
 // UseAuxiliaryTokenPolicy simulates AuxiliaryTokenPolicy.Do() method being called at the beginning of each API call
@@ -134,7 +131,7 @@ func (c *VirtualMachinesAPI) BeginCreateOrUpdate(ctx context.Context, resourceGr
 		existingVM, ok := c.Instances.Load(id)
 		if ok {
 			incomingZone := vm.Zones[0] // Note: this assumes at least 1 zone and only one zone is put on our vm
-			existingZone := existingVM.(armcompute.VirtualMachine).Zones[0]
+			existingZone := existingVM.Zones[0]
 			if incomingZone != existingZone {
 				// Currently only returning for zones, but osProfile.customData will also return this error
 				errCode := "PropertyChangeNotAllowed"
@@ -159,7 +156,7 @@ ERROR CODE: PropertyChangeNotAllowed
 				}
 			}
 			// Use existing vm rather than restoring
-			return &armcompute.VirtualMachinesClientCreateOrUpdateResponse{VirtualMachine: existingVM.(armcompute.VirtualMachine)}, nil
+			return &armcompute.VirtualMachinesClientCreateOrUpdateResponse{VirtualMachine: existingVM}, nil
 		}
 
 		vm.Name = lo.ToPtr(input.VMName)
@@ -191,7 +188,7 @@ func (c *VirtualMachinesAPI) BeginUpdate(_ context.Context, resourceGroupName st
 		if !ok {
 			return nil, &azcore.ResponseError{StatusCode: http.StatusNotFound}
 		}
-		vm := instance.(armcompute.VirtualMachine)
+		vm := instance
 
 		// If other fields need to be updated in the future, you can similarly
 		// update the VM object by merging with updates.<New Field>.
@@ -239,7 +236,7 @@ func (c *VirtualMachinesAPI) Get(_ context.Context, resourceGroupName string, vm
 			return armcompute.VirtualMachinesClientGetResponse{}, &azcore.ResponseError{StatusCode: http.StatusNotFound}
 		}
 		return armcompute.VirtualMachinesClientGetResponse{
-			VirtualMachine: instance.(armcompute.VirtualMachine),
+			VirtualMachine: instance,
 		}, nil
 	})
 }

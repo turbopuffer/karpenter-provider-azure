@@ -28,10 +28,24 @@ import (
 
 func init() {
 	karpv1.RestrictedLabelDomains = karpv1.RestrictedLabelDomains.Insert(RestrictedLabelDomains...)
+	// TODO: Uncomment this after Sept 30, see: https://github.com/Azure/karpenter-provider-azure/issues/1707
+	// karpv1.RestrictedLabels = karpv1.RestrictedLabels.Union(RestrictedLabels)
 	// Note that adding to WellKnownLabels here requires a corresponding update to
 	// computeRequirements in pkg/providers/instancetype/instancetype.go, because (as far as I can tell)
 	// Karpenter core expects that WellKnownLabels are mapped to requirements.
 	karpv1.WellKnownLabels = karpv1.WellKnownLabels.Union(AzureWellKnownLabels)
+	// Register exact, stable Azure-supported value domains for Karpenter core runtime requirement validation.
+	karpv1.WellKnownValuesForRequirements[karpv1.CapacityTypeLabelKey] = sets.New(karpv1.CapacityTypeOnDemand, karpv1.CapacityTypeSpot)
+	karpv1.WellKnownValuesForRequirements[LabelSKUAcceleratedNetworking] = sets.New("true", "false")
+	karpv1.WellKnownValuesForRequirements[LabelSKUStoragePremiumCapable] = sets.New("true", "false")
+	karpv1.WellKnownValuesForRequirements[LabelUltraSSD] = sets.New("true", "false")
+	karpv1.WellKnownValuesForRequirements[LabelSKUGPUManufacturer] = sets.New(ManufacturerNvidia, ManufacturerAMD)
+	karpv1.WellKnownValuesForRequirements[LabelPlacementScope] = sets.New(PlacementScopeZonal, PlacementScopeRegional)
+	karpv1.WellKnownValuesForRequirements[AKSLabelMode] = sets.New(ModeSystem, ModeUser)
+	karpv1.WellKnownValuesForRequirements[AKSLabelScaleSetPriority] = sets.New(ScaleSetPriorityRegular, ScaleSetPrioritySpot)
+	karpv1.WellKnownValuesForRequirements[AKSLabelPriority] = sets.New(PriorityRegular, PrioritySpot)
+	karpv1.WellKnownValuesForRequirements[AKSLabelOSSKU] = sets.New(OSSKUUbuntu, OSSKUAzureLinux)
+	karpv1.WellKnownValuesForRequirements[AKSLabelFIPSEnabled] = sets.New("true")
 }
 
 var (
@@ -41,9 +55,33 @@ var (
 		"x64":   karpv1.ArchitectureAmd64,
 		"Arm64": karpv1.ArchitectureArm64,
 	}
+
+	// We don't include kubernetes.azure.com here because there are labels in that domain that we allow users to set, but which are not
+	// WellKnownLabels (like kubernetes.azure.com/ebpf-dataplane).
 	RestrictedLabelDomains = []string{
 		Group,
 	}
+
+	RestrictedLabels = sets.New(
+		LabelSKUHyperVGeneration,
+
+		// TODO: Uncomment these label restrictions after Sept 30, see: https://github.com/Azure/karpenter-provider-azure/issues/1707
+		// Legacy labels
+		// AKSLabelLegacyAgentPool,
+		// AKSLabelLegacyStorageProfile,
+		// AKSLabelLegacyStorageTier,
+		// AKSLabelLegacyAccelerator,
+
+		// Labels we observed were set. Note that we cannot add the whole kubernetes.azure.com domain to RestrictedLabelDomains
+		// see above comment for why
+		// "kubernetes.azure.com/accelerator",
+		// "kubernetes.azure.com/agentpool",
+		// "kubernetes.azure.com/agentpool-family",
+		// "kubernetes.azure.com/availability-zone",
+		// //"kubernetes.azure.com/network-policy", // Allowing this for now
+		// "kubernetes.azure.com/storageprofile",
+		// "kubernetes.azure.com/storagetier",
+	)
 
 	AzureWellKnownLabels = sets.New(
 		LabelSKUName,
@@ -60,29 +98,31 @@ var (
 
 		LabelSKUStoragePremiumCapable,
 		LabelSKUStorageEphemeralOSMaxSize,
+		LabelUltraSSD,
 
 		LabelSKUGPUName,
 		LabelSKUGPUManufacturer,
 		LabelSKUGPUCount,
+		LabelPlacementScope,
 
 		AKSLabelCluster,
 		AKSLabelMode,
 		AKSLabelScaleSetPriority,
+		AKSLabelPriority,
 		AKSLabelOSSKU,
 		AKSLabelFIPSEnabled,
-	)
-
-	RestrictedLabels = sets.New(
-		LabelSKUHyperVGeneration,
 	)
 
 	AllowUndefinedWellKnownAndRestrictedLabels = func(options *scheduling.CompatibilityOptions) {
 		options.AllowUndefined = karpv1.WellKnownLabels.Union(RestrictedLabels)
 	}
 
-	HyperVGenerationV1 = "1"
-	HyperVGenerationV2 = "2"
-	ManufacturerNvidia = "nvidia"
+	HyperVGenerationV1     = "1"
+	HyperVGenerationV2     = "2"
+	ManufacturerNvidia     = "nvidia"
+	ManufacturerAMD        = "amd"
+	PlacementScopeZonal    = "zonal"
+	PlacementScopeRegional = "regional"
 
 	LabelSKUName    = Group + "/sku-name"    // Standard_D4pls_v6
 	LabelSKUFamily  = Group + "/sku-family"  // D
@@ -100,11 +140,14 @@ var (
 
 	LabelSKUStoragePremiumCapable     = Group + "/sku-storage-premium-capable"     // sku.IsPremiumIO
 	LabelSKUStorageEphemeralOSMaxSize = Group + "/sku-storage-ephemeralos-maxsize" // calculated as max(sku.CachedDiskBytes, sku.MaxResourceVolumeMB)
+	LabelUltraSSD                     = Group + "/sku-storage-ultra-ssd"           // sku.IsUltraSSD
 
 	// GPU labels
 	LabelSKUGPUName         = Group + "/sku-gpu-name"         // ie GPU Accelerator type we parse from vmSize
 	LabelSKUGPUManufacturer = Group + "/sku-gpu-manufacturer" // ie NVIDIA, AMD, etc
 	LabelSKUGPUCount        = Group + "/sku-gpu-count"        // ie 16, 32, etc
+
+	LabelPlacementScope = Group + "/placement-scope"
 
 	// Internal/restricted labels
 	LabelSKUHyperVGeneration = Group + "/sku-hyperv-generation" // sku.HyperVGenerations
@@ -116,6 +159,7 @@ var (
 	AKSLabelKubeletIdentityClientID = AKSLabelDomain + "/kubelet-identity-client-id"
 	AKSLabelMode                    = AKSLabelDomain + "/mode"             // "system" or "user"
 	AKSLabelScaleSetPriority        = AKSLabelDomain + "/scalesetpriority" // "spot" or "regular". Note that "regular" is never written by AKS as a label but we write it to make scheduling easier
+	AKSLabelPriority                = AKSLabelDomain + "/priority"         // "spot" or "regular".
 	AKSLabelOSSKU                   = AKSLabelDomain + "/os-sku"           // "Ubuntu" or "AzureLinux"
 	AKSLabelFIPSEnabled             = AKSLabelDomain + "/fips_enabled"     // "true" or not specified
 
@@ -154,8 +198,18 @@ const (
 )
 
 const (
+	OSSKUUbuntu     = "Ubuntu"
+	OSSKUAzureLinux = "AzureLinux"
+)
+
+const (
 	ScaleSetPriorityRegular = "regular"
 	ScaleSetPrioritySpot    = "spot"
+)
+
+const (
+	PriorityRegular = "regular"
+	PrioritySpot    = "spot"
 )
 
 var UbuntuFamilies = sets.New(
@@ -167,10 +221,10 @@ var UbuntuFamilies = sets.New(
 // imageFamilyToOSSKU maps imageFamily spec values to os-sku label values.
 // These values match what AKS writes for kubernetes.azure.com/os-sku.
 var imageFamilyToOSSKU = map[string]string{
-	UbuntuImageFamily:     "Ubuntu",
-	Ubuntu2204ImageFamily: "Ubuntu",
-	Ubuntu2404ImageFamily: "Ubuntu",
-	AzureLinuxImageFamily: "AzureLinux",
+	UbuntuImageFamily:     OSSKUUbuntu,
+	Ubuntu2204ImageFamily: OSSKUUbuntu,
+	Ubuntu2404ImageFamily: OSSKUUbuntu,
+	AzureLinuxImageFamily: OSSKUAzureLinux,
 }
 
 // GetOSSKUFromImageFamily returns the kuberentes.azure.com/os-sku label value for the given imageFamily.
