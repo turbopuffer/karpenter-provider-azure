@@ -355,14 +355,21 @@ az-build-fips: ## Build the FIPS 140-3 variant of the controller image (controll
 TPUF_ACR_REPO ?= turbopuffer.azurecr.io/turbopuffer/karpenter-azure
 TPUF_TAG ?= $(shell git describe --tags)
 
-az-release: ## Build controller + controller-fips for the current commit, push to turbopuffer ACR, mirror to GAR, print the pins
-	az acr login -n turbopuffer
+az-release-ci: ## Build controller + controller-fips, push to ACR, mirror to GAR (no az acr login)
 	skaffold build --default-repo $(TPUF_ACR_REPO) --tag $(TPUF_TAG)
 	skaffold build -p fips --default-repo $(TPUF_ACR_REPO) --tag $(TPUF_TAG)
-	hack/mirror-gar.sh $(TPUF_TAG)
+	hack/mirror-gar.sh --skip-registry-auth $(TPUF_TAG)
 
-az-mirror-gar: ## Copy already-built controller images for a tag from turbopuffer ACR to GAR (TAG=... to override, default: current commit)
-	hack/mirror-gar.sh $(TAG)
+az-release: ## Log in to ACR, then build/push/mirror (local/human entrypoint)
+	az acr login -n turbopuffer
+	$(MAKE) az-release-ci
+
+az-mirror-gar-ci: ## Copy ACR images to GAR for a tag (no registry login; TAG=... to override)
+	hack/mirror-gar.sh --skip-registry-auth $(TAG)
+
+az-mirror-gar: ## Log in, then copy ACR images to GAR (TAG=... to override, default: current commit)
+	az acr login -n turbopuffer
+	$(MAKE) az-mirror-gar-ci
 
 az-ko-prewarm-base: ## Prewarm ko's base image cache for skaffold/ko builds
 	mkdir -p $(KOCACHE)

@@ -5,13 +5,21 @@
 # stay valid.
 set -euo pipefail
 
+SKIP_REGISTRY_AUTH=0
+if [[ "${1:-}" == "--skip-registry-auth" ]]; then
+  SKIP_REGISTRY_AUTH=1
+  shift
+fi
+
 TAG="${1:-$(git describe --tags)}"
 ACR="${ACR:-turbopuffer.azurecr.io/turbopuffer/karpenter-azure}"
 GAR="${GAR:-us-central1-docker.pkg.dev/turbopuffer-onprem/turbopuffer}"
 VARIANTS="${VARIANTS:-controller controller-fips}"
 
 # skopeo reads the docker credential store both CLIs populate.
-az acr login -n "${ACR%%.*}" >/dev/null
+if [[ "${SKIP_REGISTRY_AUTH}" -eq 0 ]]; then
+  az acr login -n "${ACR%%.*}" >/dev/null
+fi
 gcloud auth configure-docker "${GAR%%/*}" --quiet >/dev/null
 
 for v in $VARIANTS; do
