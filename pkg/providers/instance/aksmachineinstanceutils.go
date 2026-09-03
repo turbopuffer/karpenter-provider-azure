@@ -20,11 +20,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"strings"
+	"time"
 
-	sdkerrors "github.com/Azure/azure-sdk-for-go-extensions/pkg/errors"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v8"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v9"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -32,7 +31,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	coreapis "sigs.k8s.io/karpenter/pkg/apis"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	corecloudprovider "sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -45,6 +43,7 @@ import (
 	labelspkg "github.com/Azure/karpenter-provider-azure/pkg/providers/labels"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
+	"github.com/Azure/karpenter-provider-azure/pkg/utils/zones"
 )
 
 var (
@@ -55,6 +54,14 @@ var (
 	AKSScaleSetPriorityToKarpCapacityType = map[armcontainerservice.ScaleSetPriority]string{
 		armcontainerservice.ScaleSetPrioritySpot:    karpv1.CapacityTypeSpot,
 		armcontainerservice.ScaleSetPriorityRegular: karpv1.CapacityTypeOnDemand,
+	}
+	KarpCapacityTypeToScaleSetPriorityLabel = map[string]string{
+		karpv1.CapacityTypeSpot:     v1beta1.ScaleSetPrioritySpot,
+		karpv1.CapacityTypeOnDemand: v1beta1.ScaleSetPriorityRegular,
+	}
+	KarpCapacityTypeToPriorityLabel = map[string]string{
+		karpv1.CapacityTypeSpot:     v1beta1.PrioritySpot,
+		karpv1.CapacityTypeOnDemand: v1beta1.PriorityRegular,
 	}
 )
 
@@ -82,6 +89,7 @@ func BuildNodeClaimFromAKSMachineTemplate(
 	vmResourceID string,
 	isDeleting bool,
 	aksMachineNodeImageVersion string,
+	creationTimestamp time.Time,
 ) (*karpv1.NodeClaim, error) {
 	nodeClaim := &karpv1.NodeClaim{}
 	labels := map[string]string{}
@@ -95,16 +103,20 @@ func BuildNodeClaimFromAKSMachineTemplate(
 	}
 	if zone != nil {
 		labels[corev1.LabelTopologyZone] = *zone
+		labels[v1beta1.LabelPlacementScope] = zones.PlacementScopeForZone(*zone)
 	}
 	labels[karpv1.CapacityTypeLabelKey] = capacityType
-	if tag, ok := aksMachineTemplate.Properties.Tags[NodePoolTagKey]; ok {
+	labels[v1beta1.AKSLabelScaleSetPriority] = KarpCapacityTypeToScaleSetPriorityLabel[capacityType]
+	labels[v1beta1.AKSLabelPriority] = KarpCapacityTypeToPriorityLabel[capacityType]
+	labels[v1beta1.LabelUltraSSD] = ultraSSDLabelFromAKSMachineTemplate(aksMachineTemplate)
+	if tag, ok := aksMachineTemplate.Properties.Tags[launchtemplate.NodePoolTagKey]; ok {
 		labels[karpv1.NodePoolLabelKey] = *tag
 	}
 	if tag, ok := aksMachineTemplate.Properties.Tags[launchtemplate.KarpenterAKSMachineNodeClaimTagKey]; ok {
 		// Missing tag (by design, only possible if user intervenes) will eventually be repaired by in-place update controller.
 		// By the time of writing, this is being used for logging purposes within provider only.
 		// That is unlikely to change for core. But be mindful of provider is to rely on this in that situation. Still, rare.
-		// This was less of a concern for VM instance as NodeClaim name is always inferrable from instance name.
+		// This was less of a concern for VM instance as NodeClaim name is always inferable from instance name.
 		nodeClaim.Name = *tag
 	}
 	nodeClaim.Labels = labels
@@ -114,11 +126,7 @@ func BuildNodeClaimFromAKSMachineTemplate(
 	// Note: this assignment to NodeClaim is not effective to the actual object in the cluster, which still represents NodeClaim's (not instance's) creation time.
 	// This "borrowed struct field" is used by provider for instance garbage collection. AWS does the same.
 	// Note that it is incorrect to use actual NodeClaim's creation time, as retries can occur on the same NodeClaim, hurting grace period with each.
-	//
-	// Use MachineStatus.CreationTimestamp (server-side) if available, otherwise fallback to epoch (zero value).
-	if aksMachineTemplate.Properties.Status != nil && aksMachineTemplate.Properties.Status.CreationTimestamp != nil {
-		nodeClaim.CreationTimestamp = AKSMachineTimestampToMeta(*aksMachineTemplate.Properties.Status.CreationTimestamp)
-	}
+	nodeClaim.CreationTimestamp = AKSMachineTimestampToMeta(creationTimestamp)
 
 	// Set the deletionTimestamp to be the current time if the instance is currently terminating
 	if isDeleting {
@@ -130,6 +138,10 @@ func BuildNodeClaimFromAKSMachineTemplate(
 	return nodeClaim, nil
 }
 
+func ultraSSDLabelFromAKSMachineTemplate(aksMachineTemplate *armcontainerservice.Machine) string {
+	return fmt.Sprint(aksMachineTemplate != nil && aksMachineTemplate.Properties != nil && aksMachineTemplate.Properties.Hardware != nil && lo.FromPtr(aksMachineTemplate.Properties.Hardware.UltraSsdEnabled))
+}
+
 // Expect AKS machine struct to be fully populated as if it comes from GET.
 // Not assuming that NodeClaim exists.
 func BuildNodeClaimFromAKSMachine(ctx context.Context, aksMachine *armcontainerservice.Machine, possibleInstanceTypes []*corecloudprovider.InstanceType, aksMachineLocation string) (*karpv1.NodeClaim, error) {
@@ -137,11 +149,9 @@ func BuildNodeClaimFromAKSMachine(ctx context.Context, aksMachine *armcontainers
 	if err := validateRetrievedAKSMachineBasicProperties(aksMachine); err != nil {
 		return nil, fmt.Errorf("failed to validate AKS machine instance %q: %w", lo.FromPtr(aksMachine.Name), err)
 	}
-	var zonePtr *string // This one is optional.
-	if len(aksMachine.Zones) < 1 || aksMachine.Zones[0] == nil {
-		log.FromContext(ctx).Info("AKS machine instance is missing zone", "aksMachineName", lo.FromPtr(aksMachine.Name))
-	} else {
-		zonePtr = lo.ToPtr(utils.MakeAKSLabelZoneFromARMZone(aksMachineLocation, lo.FromPtr(aksMachine.Zones[0])))
+	zone, err := zones.MakeAKSLabelZoneFromARMZones(aksMachineLocation, aksMachine.Zones)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get zone for AKS machine %q: %w", lo.FromPtr(aksMachine.Name), err)
 	}
 
 	return BuildNodeClaimFromAKSMachineTemplate(
@@ -149,11 +159,12 @@ func BuildNodeClaimFromAKSMachine(ctx context.Context, aksMachine *armcontainers
 		aksMachine,
 		offerings.GetInstanceTypeFromVMSize(lo.FromPtr(aksMachine.Properties.Hardware.VMSize), possibleInstanceTypes),
 		getCapacityTypeFromAKSScaleSetPriority(lo.FromPtr(aksMachine.Properties.Priority)),
-		zonePtr,
+		&zone,
 		lo.FromPtr(aksMachine.ID),
 		lo.FromPtr(aksMachine.Properties.ResourceID),
 		isAKSMachineDeleting(aksMachine),
 		lo.FromPtr(aksMachine.Properties.NodeImageVersion), // Empty: not fatal, no need to check
+		lo.FromPtr(aksMachine.Properties.Status.CreationTimestamp),
 	)
 }
 
@@ -176,7 +187,7 @@ func FindNodePoolFromAKSMachine(ctx context.Context, aksMachine *armcontainerser
 // If total length exceeds AKS machine name limit, the exceeded part will be replaced with another deterministic hash.
 // E.g., "thisisalongnodepoolname-a1b2c" --> "thisisalongnoz9y8x7-a1b2c"
 func GetAKSMachineNameFromNodeClaimName(nodeClaimName string) (string, error) {
-	const maxAKSMachineNameLength = 35 // Defined by AKS machine API.
+	const maxAKSMachineNameLength = 34 // Defined by AKS machine API.
 	const prefixHashLength = 6         // The length of the hashed part replacing the exceeded part of the prefix.
 	// If 6, given alphanumeric hash, there will be a total of 36^6 = 2,176,782,336 combinations.
 
@@ -252,37 +263,13 @@ func isAKSMachineDeleting(aksMachine *armcontainerservice.Machine) bool {
 	return false
 }
 
-// GetAKSLabelZoneFromAKSMachine returns the zone for the given AKS machine, or an empty string if there is no zone specified
-// This function is analogous to utils.GetAKSLabelZoneFromVM but for AKS machines
+// GetAKSLabelZoneFromAKSMachine returns the zone for the given AKS machine, or RegionalZone ("0") if there is no zone specified.
+// This function is analogous to zones.MakeAKSLabelZoneFromVM but for AKS machines.
 func GetAKSLabelZoneFromAKSMachine(aksMachine *armcontainerservice.Machine, location string) (string, error) {
 	if aksMachine == nil {
 		return "", fmt.Errorf("cannot pass in a nil AKS machine")
 	}
-	if aksMachine.Zones == nil {
-		return "", nil
-	}
-	if len(aksMachine.Zones) == 1 {
-		if location == "" {
-			return "", fmt.Errorf("AKS machine is missing location")
-		}
-		return utils.MakeAKSLabelZoneFromARMZone(location, lo.FromPtr(aksMachine.Zones[0])), nil
-	}
-	if len(aksMachine.Zones) > 1 {
-		return "", fmt.Errorf("AKS machine has multiple zones")
-	}
-	return "", nil
-}
-
-func IsAKSMachineOrMachinesPoolNotFound(err error) bool {
-	if err == nil {
-		return false
-	}
-	azErr := sdkerrors.IsResponseError(err)
-	if azErr != nil && (azErr.StatusCode == http.StatusNotFound || // Covers AKS machines pool not found on PUT machine, GET machine, GET (list) machines, POST agent pool (DELETE machines), and AKS machine not found on GET machine
-		(azErr.StatusCode == http.StatusBadRequest && azErr.ErrorCode == "InvalidParameter" && strings.Contains(azErr.Error(), "Cannot find any valid machines"))) { // Covers AKS machine not found on POST agent pool (DELETE machines)
-		return true
-	}
-	return false
+	return zones.MakeAKSLabelZoneFromARMZones(location, aksMachine.Zones)
 }
 
 func validateRetrievedAKSMachineBasicProperties(aksMachine *armcontainerservice.Machine) error {
@@ -290,6 +277,9 @@ func validateRetrievedAKSMachineBasicProperties(aksMachine *armcontainerservice.
 	// Thus, check every usage before removing each validation.
 	if aksMachine.Properties == nil {
 		return fmt.Errorf("irretrievable properties")
+	}
+	if aksMachine.Properties.Status == nil {
+		return fmt.Errorf("irretrievable status")
 	}
 	if aksMachine.Properties.Hardware == nil || aksMachine.Properties.Hardware.VMSize == nil {
 		return fmt.Errorf("irretrievable VM size")
@@ -309,11 +299,14 @@ func validateRetrievedAKSMachineBasicProperties(aksMachine *armcontainerservice.
 	if aksMachine.Properties.NodeImageVersion == nil {
 		return fmt.Errorf("irretrievable node image version")
 	}
+	if aksMachine.Properties.Status.CreationTimestamp == nil {
+		return fmt.Errorf("irretrievable creation timestamp")
+	}
 	return nil
 }
 
 func shouldAKSMachinesBeVisible(ctx context.Context) bool {
-	return options.FromContext(ctx).ProvisionMode == consts.ProvisionModeAKSMachineAPI || options.FromContext(ctx).ManageExistingAKSMachines
+	return options.FromContext(ctx).IsAKSMachineAPIMode() || options.FromContext(ctx).ManageExistingAKSMachines
 }
 
 // BuildJSONFromAKSMachine returns a JSON string representation of an AKS Machine for logging/debugging purposes.

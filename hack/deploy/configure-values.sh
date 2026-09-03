@@ -19,8 +19,8 @@ PROVISION_MODE=${6:-}
 AKS_MACHINES_POOL_NAME=${7:-testmpool}
 
 # Validate PROVISION_MODE
-if [[ -n "$PROVISION_MODE" && "$PROVISION_MODE" != "aksmachineapi" && "$PROVISION_MODE" != "bootstrappingclient" && "$PROVISION_MODE" != "aksscriptless" ]]; then
-    echo "Error: Invalid provision-mode '$PROVISION_MODE'. Must be one of: aksmachineapi, bootstrappingclient, aksscriptless, or empty"
+if [[ -n "$PROVISION_MODE" && "$PROVISION_MODE" != "aksmachineapi" && "$PROVISION_MODE" != "aksmachineapiheaderbatch" && "$PROVISION_MODE" != "bootstrappingclient" && "$PROVISION_MODE" != "aksscriptless" ]]; then
+    echo "Error: Invalid provision-mode '$PROVISION_MODE'. Must be one of: aksmachineapi, aksmachineapiheaderbatch, bootstrappingclient, aksscriptless, or empty"
     exit 1
 fi
 
@@ -71,6 +71,7 @@ VNET_GUID=$(jq -r ".resourceGuid // empty" <<< "$VNET_JSON")
 NETWORK_PLUGIN=$(jq -r ".networkProfile.networkPlugin // empty | if . == \"none\" then \"\" else . end" <<< "$AKS_JSON")
 NETWORK_PLUGIN_MODE=$(jq -r ".networkProfile.networkPluginMode // empty | if . == \"none\" then \"\" else . end" <<< "$AKS_JSON")
 NETWORK_POLICY=$(jq -r ".networkProfile.networkPolicy // empty | if . == \"none\" then \"\" else . end" <<< "$AKS_JSON")
+NETWORK_DATAPLANE=$(jq -r ".networkProfile.networkDataplane // empty | if . == \"none\" then \"\" else . end" <<< "$AKS_JSON")
 
 NODE_IDENTITIES=$(jq -r ".identityProfile.kubeletidentity.resourceId" <<< "$AKS_JSON")
 
@@ -79,14 +80,14 @@ KUBELET_IDENTITY_CLIENT_ID=$(jq -r ".identityProfile.kubeletidentity.clientId //
 
 AZURE_SIG_SUBSCRIPTION_ID=""
 USE_SIG="false"
-# For Machine API mode
-if [[ "${PROVISION_MODE:-}" == "aksmachineapi" ]]; then
+# For Machine API modes
+if [[ "${PROVISION_MODE:-}" == "aksmachineapi" || "${PROVISION_MODE:-}" == "aksmachineapiheaderbatch" ]]; then
     USE_SIG="true"
     AZURE_SIG_SUBSCRIPTION_ID=109a5e88-712a-48ae-9078-9ca8b3c81345
 fi
 
 export CLUSTER_NAME AZURE_LOCATION AZURE_RESOURCE_GROUP AZURE_RESOURCE_GROUP_MC KARPENTER_SERVICE_ACCOUNT_NAME \
-    CLUSTER_ENDPOINT BOOTSTRAP_TOKEN SSH_PUBLIC_KEY VNET_SUBNET_ID KARPENTER_USER_ASSIGNED_CLIENT_ID NODE_IDENTITIES AZURE_SUBSCRIPTION_ID NETWORK_PLUGIN NETWORK_PLUGIN_MODE NETWORK_POLICY \
+    CLUSTER_ENDPOINT BOOTSTRAP_TOKEN SSH_PUBLIC_KEY VNET_SUBNET_ID KARPENTER_USER_ASSIGNED_CLIENT_ID NODE_IDENTITIES AZURE_SUBSCRIPTION_ID NETWORK_PLUGIN NETWORK_PLUGIN_MODE NETWORK_POLICY NETWORK_DATAPLANE \
     LOG_LEVEL VNET_GUID KUBELET_IDENTITY_CLIENT_ID ENABLE_AZURE_SDK_LOGGING PROVISION_MODE USE_SIG AZURE_SIG_SUBSCRIPTION_ID AKS_MACHINES_POOL_NAME
 
 # get karpenter-values-template.yaml, if not already present (e.g. outside of repo context)

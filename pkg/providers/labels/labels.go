@@ -111,6 +111,7 @@ func Get(
 	// See https://github.com/kubernetes-sigs/karpenter/issues/1772
 	labels[karpv1.NodeDoNotSyncTaintsLabelKey] = "true"
 	labels[v1beta1.AKSLabelScaleSetPriority] = v1beta1.ScaleSetPriorityRegular
+	labels[v1beta1.AKSLabelPriority] = v1beta1.PriorityRegular
 	// Add os-sku label based on imageFamily
 	labels[v1beta1.AKSLabelOSSKU] = v1beta1.GetOSSKUFromImageFamily(lo.FromPtr(nodeClass.Spec.ImageFamily))
 	if lo.FromPtr(nodeClass.Spec.FIPSMode) == v1beta1.FIPSModeFIPS {
@@ -120,7 +121,7 @@ func Get(
 	// Add os-sku-requested label that exactly matches the imageFamily specified on the NodeClass
 	labels[v1beta1.AKSLabelOSSKURequested] = lo.FromPtr(nodeClass.Spec.ImageFamily)
 	// nil static parameters here is safe only because we're not using the resulting imageFamily for anything except to get its name
-	imageFamily := imagefamily.GetImageFamily(nodeClass.Spec.ImageFamily, nodeClass.Spec.FIPSMode, kubernetesVersion, nil)
+	imageFamily := imagefamily.GetImageFamily(nodeClass.Spec.ImageFamily, nodeClass.Spec.FIPSMode, nodeClass.IsTrustedLaunchEnabled(), kubernetesVersion, nil)
 	labels[v1beta1.AKSLabelOSSKUEffective] = imageFamily.Name()
 
 	if opts.IsAzureCNIOverlay() {

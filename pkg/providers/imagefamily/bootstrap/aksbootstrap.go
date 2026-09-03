@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/blang/semver/v4"
@@ -40,7 +41,8 @@ type AKS struct {
 	KubeletIdentityClientID        string
 	Location                       string
 	ResourceGroup                  string
-	ClusterID                      string
+	NetworkSecurityGroupName       string
+	RouteTableName                 string
 	APIServerName                  string
 	KubeletClientTLSBootstrapToken string
 	NetworkPlugin                  string
@@ -49,6 +51,11 @@ type AKS struct {
 }
 
 var _ Bootstrapper = (*AKS)(nil) // assert AKS implements Bootstrapper
+
+const (
+	nodeHardeningKubeReservedCgroup   = "/kubereserved.slice"
+	nodeHardeningSystemReservedCgroup = "/system.slice"
+)
 
 func (a AKS) Script() (string, error) {
 	bootstrapScript, err := a.aksBootstrapScript()
@@ -108,7 +115,7 @@ type NodeBootstrapVariables struct {
 	SubscriptionID                          string   // a   can be derived from environment/imds
 	ResourceGroup                           string   // a   can be derived from environment/imds
 	Location                                string   // a   can be derived from environment/imds
-	VMType                                  string   // xd  derived from cluster but unnecessary (?) only used by CCM [will default to "vmss" for now]
+	VMType                                  string   // xd  derived from cluster but unnecessary (?) only used by CCM
 	Subnet                                  string   // xd  derived from cluster but unnecessary (?) only used by CCM [will default to "aks-subnet for now]
 	NetworkSecurityGroup                    string   // xk  derived from cluster but unnecessary (?) only used by CCM [= "aks-agentpool-<clusterid>-nsg" for now]
 	VirtualNetwork                          string   // xk  derived from cluster but unnecessary (?) only used by CCM [= "aks-vnet-<clusterid>" for now]
@@ -302,15 +309,22 @@ func (a AKS) applyOptions(nbv *NodeBootstrapVariables) {
 	nbv.VNETCNILinuxPluginsURL = fmt.Sprintf("%s/azure-cni/v1.4.32/binaries/azure-vnet-cni-linux-%s-v1.4.32.tgz", globalAKSMirror, a.Arch)
 	nbv.CNIPluginsURL = fmt.Sprintf("%s/cni-plugins/v1.1.1/binaries/cni-plugins-linux-%s-v1.1.1.tgz", globalAKSMirror, a.Arch)
 	// calculated values
-	nbv.NetworkSecurityGroup = fmt.Sprintf("aks-agentpool-%s-nsg", a.ClusterID)
-	nbv.RouteTable = fmt.Sprintf("aks-agentpool-%s-routetable", a.ClusterID)
+	nbv.NetworkSecurityGroup = a.NetworkSecurityGroupName
+	nbv.RouteTable = a.RouteTableName
 
-	if a.GPUNode {
+	if a.GPUNode && a.GPUDriverInstallationEnabled {
 		nbv.GPUNode = true
 		nbv.ConfigGPUDriverIfNeeded = true
 		nbv.GPUDriverVersion = a.GPUDriverVersion
 		nbv.GPUDriverType = a.GPUDriverType
 		nbv.GPUImageSHA = a.GPUImageSHA
+	} else {
+		// For non-GPU nodes or GPU nodes with mode: None,
+		// GPUNode is set to false and ConfigGPUDriverIfNeeded is false.
+		// AgentBaker requires GPU_NODE=false to skip NVIDIA driver installation,
+		// fabric manager setup, and to use runc instead of nvidia-container-runtime.
+		// (which won't be installed without GPU driver setup).
+		nbv.ConfigGPUDriverIfNeeded = false
 	}
 
 	// merge and stringify labels
@@ -359,9 +373,12 @@ func (a AKS) applyOptions(nbv *NodeBootstrapVariables) {
 	nodeclaimKubeletConfig := kubeletConfigToMap(a.KubeletConfig)
 	kubeletFlags = lo.Assign(kubeletFlags, nodeclaimKubeletConfig)
 
-	// stringify kubelet flags (including taints)
-	nbv.KubeletFlags = strings.Join(lo.MapToSlice(kubeletFlags, func(k, v string) string {
-		return fmt.Sprintf("%s=%s", k, v)
+	// stringify kubelet flags (including taints); sort by flag name so ordering is
+	// deterministic in the rendered customData.
+	flagNames := lo.Keys(kubeletFlags)
+	sort.Strings(flagNames)
+	nbv.KubeletFlags = strings.Join(lo.Map(flagNames, func(k string, _ int) string {
+		return fmt.Sprintf("%s=%s", k, kubeletFlags[k])
 	}), " ")
 }
 
@@ -396,6 +413,14 @@ func kubeletConfigToMap(kubeletConfig *KubeletConfiguration) map[string]string {
 	JoinParameterArgsToMap(args, "--eviction-soft-grace-period", lo.MapValues(kubeletConfig.EvictionSoftGracePeriod, func(v metav1.Duration, _ string) string {
 		return v.Duration.String()
 	}), "=")
+
+	if len(kubeletConfig.EnforceNodeAllocatable) > 0 {
+		args["--enforce-node-allocatable"] = strings.Join(kubeletConfig.EnforceNodeAllocatable, ",")
+		if lo.Contains(kubeletConfig.EnforceNodeAllocatable, "kube-reserved") && lo.Contains(kubeletConfig.EnforceNodeAllocatable, "system-reserved") {
+			args["--kube-reserved-cgroup"] = nodeHardeningKubeReservedCgroup
+			args["--system-reserved-cgroup"] = nodeHardeningSystemReservedCgroup
+		}
+	}
 
 	if kubeletConfig.EvictionMaxPodGracePeriod != nil {
 		args["--eviction-max-pod-grace-period"] = fmt.Sprintf("%d", lo.FromPtr(kubeletConfig.EvictionMaxPodGracePeriod))

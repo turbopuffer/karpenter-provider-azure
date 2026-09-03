@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
+	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -117,29 +118,30 @@ func (t TaxBrackets) Calculate(amount float64) float64 {
 	return tax
 }
 
-func NewInstanceType(
+func newInstanceType(
 	ctx context.Context,
 	sku *skewer.SKU,
 	vmsize *skewer.VMSizeType,
-	kc *v1beta1.KubeletConfiguration,
 	region string,
 	offerings cloudprovider.Offerings,
-	nodeClass *v1beta1.AKSNodeClass,
+	params *instanceTypeParameters,
 	architecture string,
 ) *cloudprovider.InstanceType {
+	opts := options.FromContext(ctx)
+	totalMemoryMiB := memoryMiB(sku)
+	enableNodeHardening := opts.ShouldUseNodeHardening()
 	return &cloudprovider.InstanceType{
 		Name:         sku.GetName(),
-		Requirements: computeRequirements(options.FromContext(ctx), sku, vmsize, architecture, offerings, region, nodeClass),
+		Requirements: computeRequirements(opts, sku, vmsize, architecture, offerings, region, params),
 		Offerings:    offerings,
-		Capacity:     computeCapacity(ctx, sku, nodeClass),
+		Capacity:     computeCapacity(ctx, sku, params),
 		Overhead: &cloudprovider.InstanceTypeOverhead{
-			KubeReserved:      KubeReservedResources(lo.Must(sku.VCPU()), lo.Must(sku.Memory())),
-			SystemReserved:    SystemReservedResources(),
-			EvictionThreshold: EvictionThreshold(),
+			KubeReserved:      KubeReservedResources(lo.Must(sku.VCPU()), totalMemoryMiB, params.MaxPods, enableNodeHardening),
+			SystemReserved:    SystemReservedResources(totalMemoryMiB, opts.NetworkPlugin, enableNodeHardening),
+			EvictionThreshold: EvictionThreshold(totalMemoryMiB, enableNodeHardening),
 		},
 	}
 }
-
 func computeRequirements(
 	opts *options.Options,
 	sku *skewer.SKU,
@@ -147,7 +149,7 @@ func computeRequirements(
 	architecture string,
 	offerings cloudprovider.Offerings,
 	region string,
-	nodeClass *v1beta1.AKSNodeClass,
+	params *instanceTypeParameters,
 ) scheduling.Requirements {
 	requirements := scheduling.NewRequirements(
 		// Well Known Upstream
@@ -166,17 +168,24 @@ func computeRequirements(
 		})...),
 
 		// Well Known to Azure
+		scheduling.NewRequirement(v1beta1.LabelPlacementScope, corev1.NodeSelectorOpIn, lo.Map(offerings.Available(), func(o *cloudprovider.Offering, _ int) string {
+			return o.Requirements.Get(v1beta1.LabelPlacementScope).Any()
+		})...),
+		scheduling.NewRequirement(v1beta1.LabelUltraSSD, corev1.NodeSelectorOpIn, lo.FlatMap(offerings.Available(), func(o *cloudprovider.Offering, _ int) []string {
+			return o.Requirements.Get(v1beta1.LabelUltraSSD).Values()
+		})...),
 		scheduling.NewRequirement(v1beta1.LabelSKUCPU, corev1.NodeSelectorOpIn, fmt.Sprint(vcpuCount(sku))),
 		scheduling.NewRequirement(v1beta1.LabelSKUMemory, corev1.NodeSelectorOpIn, fmt.Sprint((memoryMiB(sku)))), // in MiB
 		scheduling.NewRequirement(v1beta1.AKSLabelCPU, corev1.NodeSelectorOpIn, fmt.Sprint(vcpuCount(sku))),      // AKS domain.
 		scheduling.NewRequirement(v1beta1.AKSLabelMemory, corev1.NodeSelectorOpIn, fmt.Sprint((memoryMiB(sku)))), // AKS domain.
-		scheduling.NewRequirement(v1beta1.LabelSKUGPUCount, corev1.NodeSelectorOpIn, fmt.Sprint(gpuNvidiaCount(sku).Value())),
+		scheduling.NewRequirement(v1beta1.LabelSKUGPUCount, corev1.NodeSelectorOpIn, fmt.Sprint(gpuTotalCount(sku).Value())),
 		scheduling.NewRequirement(v1beta1.LabelSKUGPUManufacturer, corev1.NodeSelectorOpDoesNotExist),
 		scheduling.NewRequirement(v1beta1.LabelSKUGPUName, corev1.NodeSelectorOpDoesNotExist),
 		scheduling.NewRequirement(v1beta1.AKSLabelCluster, corev1.NodeSelectorOpIn, utils.NormalizeClusterResourceGroupNameForLabel(opts.NodeResourceGroup)),
 		scheduling.NewRequirement(v1beta1.AKSLabelMode, corev1.NodeSelectorOpIn, v1beta1.ModeSystem, v1beta1.ModeUser),
 		scheduling.NewRequirement(v1beta1.AKSLabelScaleSetPriority, corev1.NodeSelectorOpIn, v1beta1.ScaleSetPriorityRegular, v1beta1.ScaleSetPrioritySpot),
-		scheduling.NewRequirement(v1beta1.AKSLabelOSSKU, corev1.NodeSelectorOpIn, v1beta1.GetOSSKUFromImageFamily(lo.FromPtr(nodeClass.Spec.ImageFamily))),
+		scheduling.NewRequirement(v1beta1.AKSLabelPriority, corev1.NodeSelectorOpIn, v1beta1.PriorityRegular, v1beta1.PrioritySpot),
+		scheduling.NewRequirement(v1beta1.AKSLabelOSSKU, corev1.NodeSelectorOpIn, v1beta1.GetOSSKUFromImageFamily(params.ImageFamily)),
 		scheduling.NewRequirement(v1beta1.AKSLabelFIPSEnabled, corev1.NodeSelectorOpDoesNotExist), // AKS only sets this label if FIPS is enabled, otherwise it's expected to be empty
 
 		// composites
@@ -206,7 +215,7 @@ func computeRequirements(
 	setRequirementsHyperVGeneration(requirements, sku)
 	setRequirementsGPU(requirements, sku, vmsize)
 	setRequirementsVersion(requirements, vmsize)
-	if lo.FromPtr(nodeClass.Spec.FIPSMode) == v1beta1.FIPSModeFIPS {
+	if params.FIPSMode == v1beta1.FIPSModeFIPS {
 		requirements[v1beta1.AKSLabelFIPSEnabled].Insert("true")
 	}
 
@@ -230,11 +239,17 @@ func setRequirementsHyperVGeneration(requirements scheduling.Requirements, sku *
 }
 
 func setRequirementsGPU(requirements scheduling.Requirements, sku *skewer.SKU, vmsize *skewer.VMSizeType) {
-	if utils.IsNvidiaEnabledSKU(sku.GetName()) {
+	manufacturer := utils.GetGPUManufacturer(sku.GetName())
+	switch manufacturer {
+	case v1beta1.ManufacturerNvidia:
 		requirements[v1beta1.LabelSKUGPUManufacturer].Insert(v1beta1.ManufacturerNvidia)
-		if vmsize.AcceleratorType != nil {
-			requirements[v1beta1.LabelSKUGPUName].Insert(*vmsize.AcceleratorType)
-		}
+	case v1beta1.ManufacturerAMD:
+		requirements[v1beta1.LabelSKUGPUManufacturer].Insert(v1beta1.ManufacturerAMD)
+	default:
+		return
+	}
+	if vmsize.AcceleratorType != nil {
+		requirements[v1beta1.LabelSKUGPUName].Insert(*vmsize.AcceleratorType)
 	}
 }
 
@@ -254,20 +269,42 @@ func getArchitecture(architecture string) string {
 	return architecture // unrecognized
 }
 
-func computeCapacity(ctx context.Context, sku *skewer.SKU, nodeClass *v1beta1.AKSNodeClass) corev1.ResourceList {
+func computeCapacity(ctx context.Context, sku *skewer.SKU, params *instanceTypeParameters) corev1.ResourceList {
 	return corev1.ResourceList{
 		corev1.ResourceCPU:                    *cpu(sku),
 		corev1.ResourceMemory:                 *memoryWithoutOverhead(ctx, sku),
-		corev1.ResourceEphemeralStorage:       *ephemeralStorage(nodeClass),
-		corev1.ResourcePods:                   *pods(ctx, nodeClass),
+		corev1.ResourceEphemeralStorage:       *ephemeralStorage(params),
+		corev1.ResourcePods:                   *pods(params),
 		corev1.ResourceName("nvidia.com/gpu"): *gpuNvidiaCount(sku),
+		corev1.ResourceName("amd.com/gpu"):    *gpuAMDCount(sku),
 	}
 }
 
-// gpuNvidiaCount returns the number of Nvidia GPUs in the SKU. Currently nvidia is the only gpu manufacturer we support.
+// gpuNvidiaCount returns the number of Nvidia GPUs in the SKU.
 func gpuNvidiaCount(sku *skewer.SKU) *resource.Quantity {
 	count, err := sku.GPU()
 	if err != nil || !utils.IsNvidiaEnabledSKU(sku.GetName()) {
+		count = 0
+	}
+	return resources.Quantity(fmt.Sprint(count))
+}
+
+// gpuAMDCount returns the number of AMD GPUs in the SKU.
+func gpuAMDCount(sku *skewer.SKU) *resource.Quantity {
+	count, err := sku.GPU()
+	if err != nil || !utils.IsAMDEnabledSKU(sku.GetName()) {
+		count = 0
+	}
+	return resources.Quantity(fmt.Sprint(count))
+}
+
+// gpuTotalCount returns the total number of GPUs in the SKU for any supported vendor.
+func gpuTotalCount(sku *skewer.SKU) *resource.Quantity {
+	if !utils.IsGPUSKU(sku.GetName()) {
+		return resources.Quantity("0")
+	}
+	count, err := sku.GPU()
+	if err != nil {
 		count = 0
 	}
 	return resources.Quantity(fmt.Sprint(count))
@@ -301,38 +338,61 @@ func CalculateMemoryWithoutOverhead(vmMemoryOverheadPercent float64, skuMemoryGi
 	return memory
 }
 
-func ephemeralStorage(nodeClass *v1beta1.AKSNodeClass) *resource.Quantity {
-	return resource.NewScaledQuantity(int64(lo.FromPtr(nodeClass.Spec.OSDiskSizeGB)), resource.Giga)
+func ephemeralStorage(params *instanceTypeParameters) *resource.Quantity {
+	return resource.NewScaledQuantity(int64(params.OSDiskSizeGB), resource.Giga)
 }
 
-func pods(ctx context.Context, nc *v1beta1.AKSNodeClass) *resource.Quantity {
-	networkPlugin, networkPluginMode := options.FromContext(ctx).NetworkPlugin, options.FromContext(ctx).NetworkPluginMode
-	return resource.NewQuantity(int64(utils.GetMaxPods(nc, networkPlugin, networkPluginMode)), resource.DecimalSI)
+func pods(params *instanceTypeParameters) *resource.Quantity {
+	return resource.NewQuantity(int64(params.MaxPods), resource.DecimalSI)
 }
 
-func SystemReservedResources() corev1.ResourceList {
-	// AKS does not set system-reserved values and only CPU and memory are considered
-	// https://learn.microsoft.com/en-us/azure/aks/concepts-clusters-workloads#resource-reservations
+func SystemReservedResources(totalMemoryMiB int64, networkPlugin string, enableNodeHardening bool) corev1.ResourceList {
+	if !enableNodeHardening {
+		return corev1.ResourceList{
+			corev1.ResourceCPU:    resource.Quantity{},
+			corev1.ResourceMemory: resource.Quantity{},
+		}
+	}
 	return corev1.ResourceList{
-		corev1.ResourceCPU:    resource.Quantity{},
-		corev1.ResourceMemory: resource.Quantity{},
+		corev1.ResourceCPU:              *resource.NewScaledQuantity(systemReservedCPUMillicores, resource.Milli),
+		corev1.ResourceMemory:           *resource.NewQuantity(systemReservedMemoryMiB(totalMemoryMiB, networkPlugin == consts.NetworkPluginAzure)*bytesPerMiB, resource.BinarySI),
+		corev1.ResourceEphemeralStorage: resource.MustParse(systemReservedEphemeralStorage),
 	}
 }
 
-func KubeReservedResources(vcpus int64, memoryGib float64) corev1.ResourceList {
-	reservedMemoryMi := int64(1024 * reservedMemoryTaxGi.Calculate(memoryGib))
+func KubeReservedResources(vcpus, totalMemoryMiB int64, maxPods int32, enableNodeHardening bool) corev1.ResourceList {
+	reservedMemoryMiB := int64(1024 * reservedMemoryTaxGi.Calculate(float64(totalMemoryMiB)/1024))
 	reservedCPUMilli := int64(1000 * reservedCPUTaxVCPU.Calculate(float64(vcpus)))
+
+	if enableNodeHardening {
+		reservedMemoryMiB = hardenedKubeReservedMemoryMiB(maxPods, totalMemoryMiB)
+	}
 
 	resources := corev1.ResourceList{
 		corev1.ResourceCPU:    *resource.NewScaledQuantity(reservedCPUMilli, resource.Milli),
-		corev1.ResourceMemory: *resource.NewQuantity(reservedMemoryMi*1024*1024, resource.BinarySI),
+		corev1.ResourceMemory: *resource.NewQuantity(reservedMemoryMiB*bytesPerMiB, resource.BinarySI),
 	}
 
 	return resources
 }
 
-func EvictionThreshold() corev1.ResourceList {
+func EvictionThreshold(totalMemoryMiB int64, enableNodeHardening bool) corev1.ResourceList {
+	if enableNodeHardening {
+		_, hardMemoryMiB := evictionMemoryLadder(totalMemoryMiB)
+		return corev1.ResourceList{
+			corev1.ResourceMemory: *resource.NewQuantity(hardMemoryMiB*bytesPerMiB, resource.BinarySI),
+		}
+	}
 	return corev1.ResourceList{
 		corev1.ResourceMemory: resource.MustParse(DefaultMemoryAvailable),
+	}
+}
+
+// SoftEvictionThreshold returns the hardened soft-eviction memory threshold
+// for the VM's total memory using the AKS RP memory ladder.
+func SoftEvictionThreshold(totalMemoryMiB int64) corev1.ResourceList {
+	softMemoryMiB, _ := evictionMemoryLadder(totalMemoryMiB)
+	return corev1.ResourceList{
+		corev1.ResourceMemory: *resource.NewQuantity(softMemoryMiB*bytesPerMiB, resource.BinarySI),
 	}
 }

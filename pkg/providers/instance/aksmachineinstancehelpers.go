@@ -22,7 +22,7 @@ import (
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v8"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v9"
 	"github.com/samber/lo"
 	v1 "k8s.io/api/core/v1"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -37,11 +37,20 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/labels"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
+	"github.com/Azure/karpenter-provider-azure/pkg/utils/zones"
 )
 
 // buildAKSMachineTemplate creates an in-memory AKS machine template from the provided specs.
 // May return error whenever required fields are not set (check carefully).
-func (p *DefaultAKSMachineProvider) buildAKSMachineTemplate(ctx context.Context, instanceType *corecloudprovider.InstanceType, capacityType string, zone string, nodeClass *v1beta1.AKSNodeClass, nodeClaim *karpv1.NodeClaim) (*armcontainerservice.Machine, error) {
+//
+// BATCH AWARENESS: This template is used both for single-VM creates and as the shared
+// template body in batch creates. When adding new MachineProperties fields:
+//   - If the field varies per NodeClaim (like Tags), also update clearPerMachineFields in
+//     pkg/providers/azclient/aksmachinesheaderbatch/batch_field_registry.go so the batch
+//     system knows to move it to the per-machine header.
+//   - If the field is the same for all NodeClaims in a NodePool+NodeClass (like VMSize),
+//     no action needed — it's automatically part of the shared template and batch grouping hash.
+func (p *DefaultAKSMachineProvider) buildAKSMachineTemplate(ctx context.Context, instanceType *corecloudprovider.InstanceType, capacityType string, placementScope string, zone string, ultraSSD bool, nodeClass *v1beta1.AKSNodeClass, nodeClaim *karpv1.NodeClaim) (*armcontainerservice.Machine, error) {
 	if instanceType == nil {
 		return nil, fmt.Errorf("InstanceType is not set")
 	}
@@ -64,7 +73,7 @@ func (p *DefaultAKSMachineProvider) buildAKSMachineTemplate(ctx context.Context,
 	}
 
 	// GPUProfile
-	gpuProfile := configureGPUProfile(instanceType)
+	gpuProfile := configureGPUProfile(instanceType, nodeClass)
 
 	// OrchestratorVersion (i.e., Kubernetes version)
 	orchestratorVersion, err := nodeClass.GetKubernetesVersion()
@@ -88,17 +97,24 @@ func (p *DefaultAKSMachineProvider) buildAKSMachineTemplate(ctx context.Context,
 	nodeInitializationTaints, nodeTaints := configureTaints(nodeClaim)
 
 	// NodeLabels, Mode
-	nodeLabels, modePtr := configureLabelsAndMode(nodeClaim, instanceType, capacityType)
+	nodeLabels, modePtr := configureLabelsAndMode(nodeClaim, instanceType, capacityType, placementScope, ultraSSD)
 
 	// Priority (e.g., regular, spot)
 	priority := configurePriority(capacityType)
 
 	// Tags (to be put on AKS machine and all affiliated resources)
 	// Note: as of the time of writing, AKS machine API does not support tags on NICs. This could be fixed server-side.
+	//
+	// BATCH: Tags is a per-machine field (varies per NodeClaim). If you change this,
+	// see batch_field_registry.go — ClearPerMachineFields must cover any new per-machine
+	// MachineProperties field so batch grouping and header extraction stay correct.
 	tags := ConfigureAKSMachineTags(options.FromContext(ctx), nodeClass, nodeClaim)
 
 	return &armcontainerservice.Machine{
-		Zones: utils.MakeARMZonesFromAKSLabelZone(zone),
+		// BATCH: Zones is a per-machine field (selected from instance type offerings).
+		// It lives on Machine (not MachineProperties) so it's excluded from template
+		// hashing by design. See batch_field_registry.go for the full field classification.
+		Zones: zones.MakeARMZonesFromAKSLabelZone(zone),
 		Properties: &armcontainerservice.MachineProperties{
 			NodeImageVersion: lo.ToPtr(nodeImageVersion),
 			Network: &armcontainerservice.MachineNetworkProperties{
@@ -112,7 +128,8 @@ func (p *DefaultAKSMachineProvider) buildAKSMachineTemplate(ctx context.Context,
 			Hardware: &armcontainerservice.MachineHardwareProfile{
 				VMSize: lo.ToPtr(instanceType.Name),
 				// GPUInstanceProfile: nil,
-				GpuProfile: gpuProfile,
+				GpuProfile:      gpuProfile,
+				UltraSsdEnabled: lo.ToPtr(ultraSSD),
 			},
 			OperatingSystem: &armcontainerservice.MachineOSProfile{
 				OSType:       lo.ToPtr(armcontainerservice.OSTypeLinux),
@@ -120,7 +137,15 @@ func (p *DefaultAKSMachineProvider) buildAKSMachineTemplate(ctx context.Context,
 				OSDiskSizeGB: nodeClass.Spec.OSDiskSizeGB, // AKS machine API defaults it if nil
 				OSDiskType:   osDiskType,
 				EnableFIPS:   enableFIPS,
-				// LinuxProfile:   nil,
+				LinuxProfile: func() *armcontainerservice.MachineOSProfileLinuxProfile {
+					linuxOSConfig := configureLinuxOSConfig(nodeClass)
+					if linuxOSConfig == nil {
+						return nil
+					}
+					return &armcontainerservice.MachineOSProfileLinuxProfile{
+						LinuxOSConfig: linuxOSConfig,
+					}
+				}(),
 				// WindowsProfile: nil,
 			},
 
@@ -133,32 +158,107 @@ func (p *DefaultAKSMachineProvider) buildAKSMachineTemplate(ctx context.Context,
 				NodeTaints:               nodeTaints,
 				MaxPods:                  nodeClass.Spec.MaxPods, // AKS machine API defaults it per network plugins if nil.
 				// WorkloadRuntime:          nil,
-				// ArtifactStreamingProfile: nil,
+				ArtifactStreamingProfile: configureArtifactStreamingProfile(nodeClass, instanceType),
 			},
 
 			Mode: modePtr,
 			Security: &armcontainerservice.MachineSecurityProfile{
 				SSHAccess:              lo.ToPtr(armcontainerservice.AgentPoolSSHAccessLocalUser),
 				EnableEncryptionAtHost: lo.ToPtr(nodeClass.GetEncryptionAtHost()),
-				// EnableVTPM:             nil,
-				// EnableSecureBoot:       nil,
+				EnableVTPM:             lo.ToPtr(nodeClass.IsVTPMEnabled()),
+				EnableSecureBoot:       lo.ToPtr(nodeClass.IsSecureBootEnabled()),
 			},
 			Priority: priority,
 
-			Tags: tags,
+			Tags:            tags,
+			LocalDNSProfile: configureLocalDNSProfile(nodeClass),
 		},
 	}, nil
 }
 
-func configureGPUProfile(instanceType *corecloudprovider.InstanceType) *armcontainerservice.GPUProfile {
-	// If none is specified, then that's not GPU instance, so nil is fine. Current version of AKS machine API supports this.
-	if utils.IsNvidiaEnabledSKU(instanceType.Name) {
-		return &armcontainerservice.GPUProfile{
-			Driver: lo.ToPtr(armcontainerservice.GPUDriverInstall),
-			// DriverType: nil,
+func configureGPUProfile(instanceType *corecloudprovider.InstanceType, nodeClass *v1beta1.AKSNodeClass) *armcontainerservice.GPUProfile {
+	// Non-GPU SKUs don't need a GPU profile.
+	if !utils.IsGPUSKU(instanceType.Name) {
+		return nil
+	}
+	// GPU SKUs: pass through the driver setting from nodeClass.
+	// "Driver" mode -> Install, "None" mode -> None (treat as non-GPU).
+	// Upstream instance type filtering already ensures invalid SKU+mode combinations
+	// (e.g., AMD GPU with Driver mode) are excluded before reaching here.
+	driverSetting := armcontainerservice.GPUDriverNone
+	if nodeClass.IsGPUDriverInstallationEnabled() {
+		driverSetting = armcontainerservice.GPUDriverInstall
+	}
+	return &armcontainerservice.GPUProfile{
+		Driver: lo.ToPtr(driverSetting),
+	}
+}
+
+func configureArtifactStreamingProfile(nodeClass *v1beta1.AKSNodeClass, instanceType *corecloudprovider.InstanceType) *armcontainerservice.AgentPoolArtifactStreamingProfile {
+	arch := instanceType.Requirements.Get(v1.LabelArchStable).Values()[0]
+	if nodeClass.IsArtifactStreamingEnabled(arch) {
+		return &armcontainerservice.AgentPoolArtifactStreamingProfile{
+			Enabled: lo.ToPtr(true),
 		}
 	}
 	return nil
+}
+
+func configureLocalDNSProfile(nodeClass *v1beta1.AKSNodeClass) *armcontainerservice.LocalDNSProfile {
+	// Use the wire-resolved spec so Karpenter's Preferred-mode decision
+	// (recorded on the AKSNodeClass via Status.LocalDNSState) is honored
+	// end-to-end downstream. This guarantees a deterministic and consistent
+	// LocalDNS decision across Machines spawned from the same NodeClass:
+	// Preferred is never sent downstream, so it can never be re-interpreted.
+	// See AKSNodeClass.ResolvedLocalDNSForWire for the full rationale.
+	spec := nodeClass.ResolvedLocalDNSForWire()
+	if spec == nil {
+		return nil
+	}
+	profile := &armcontainerservice.LocalDNSProfile{}
+	if spec.Mode != "" {
+		profile.Mode = lo.ToPtr(armcontainerservice.LocalDNSMode(spec.Mode))
+	}
+	if len(spec.VnetDNSOverrides) > 0 {
+		profile.VnetDNSOverrides = convertLocalDNSOverrides(spec.VnetDNSOverrides)
+	}
+	if len(spec.KubeDNSOverrides) > 0 {
+		profile.KubeDNSOverrides = convertLocalDNSOverrides(spec.KubeDNSOverrides)
+	}
+	return profile
+}
+
+func convertLocalDNSOverrides(overrides []v1beta1.LocalDNSZoneOverride) map[string]*armcontainerservice.LocalDNSOverride {
+	result := make(map[string]*armcontainerservice.LocalDNSOverride, len(overrides))
+	for _, o := range overrides {
+		override := &armcontainerservice.LocalDNSOverride{}
+		if o.QueryLogging != "" {
+			override.QueryLogging = lo.ToPtr(armcontainerservice.LocalDNSQueryLogging(o.QueryLogging))
+		}
+		if o.Protocol != "" {
+			override.Protocol = lo.ToPtr(armcontainerservice.LocalDNSProtocol(o.Protocol))
+		}
+		if o.ForwardDestination != "" {
+			override.ForwardDestination = lo.ToPtr(armcontainerservice.LocalDNSForwardDestination(o.ForwardDestination))
+		}
+		if o.ForwardPolicy != "" {
+			override.ForwardPolicy = lo.ToPtr(armcontainerservice.LocalDNSForwardPolicy(o.ForwardPolicy))
+		}
+		if o.MaxConcurrent != nil {
+			override.MaxConcurrent = o.MaxConcurrent
+		}
+		if o.CacheDuration.Duration != nil {
+			override.CacheDurationInSeconds = lo.ToPtr(int32(o.CacheDuration.Seconds()))
+		}
+		if o.ServeStaleDuration.Duration != nil {
+			override.ServeStaleDurationInSeconds = lo.ToPtr(int32(o.ServeStaleDuration.Seconds()))
+		}
+		if o.ServeStale != "" {
+			override.ServeStale = lo.ToPtr(armcontainerservice.LocalDNSServeStale(o.ServeStale))
+		}
+		result[o.Zone] = override
+	}
+	return result
 }
 
 func configureOSDiskType(ctx context.Context, instanceTypeProvider instancetype.Provider, nodeClass *v1beta1.AKSNodeClass, instanceType *corecloudprovider.InstanceType) (*armcontainerservice.OSDiskType, error) {
@@ -232,21 +332,21 @@ func configureTaints(nodeClaim *karpv1.NodeClaim) ([]*string, []*string) {
 	return nodeInitializationTaintPtrs, nodeTaintPtrs
 }
 
-func configureLabelsAndMode(nodeClaim *karpv1.NodeClaim, instanceType *corecloudprovider.InstanceType, capacityType string) (map[string]*string, *armcontainerservice.AgentPoolMode) {
+func configureLabelsAndMode(nodeClaim *karpv1.NodeClaim, instanceType *corecloudprovider.InstanceType, capacityType string, placementScope string, ultraSSD bool) (map[string]*string, *armcontainerservice.AgentPoolMode) {
 	// Counterpart for ProvisionModeBootstrappingClient is in customscriptsbootstrap/provisionclientbootstrap.go and instance/vminstance.go
 
 	// We need to get all single-valued requirement labels from the instance type and the nodeClaim to pass down to kubelet.
 	// We don't just include single-value labels from the instance type because in the case where the label is NOT single-value on the instance
 	// (i.e. there are options), the nodeClaim may have selected one of those options via its requirements which we want to include.
-	// These may contain restricted labels from the pod that we need to filter out. We don't bother filtering the instance type requirements below because
-	// we know those can't be restricted since they're controlled by the provider and none use the kubernetes.io domain.
-	claimLabels := labels.GetFilteredSingleValuedRequirementLabels(
+	// These may contain restricted labels from the pod that we need to filter out; that's done by the OmitBy below.
+	claimLabels := labels.GetAllSingleValuedRequirementLabels(
 		scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...),
-		func(k string, req *scheduling.Requirement) bool {
-			return labels.CanKubeletSetLabel(k)
-		},
 	)
-	nodeLabels := lo.Assign(nodeClaim.Labels, claimLabels, labels.GetAllSingleValuedRequirementLabels(instanceType.Requirements), map[string]string{karpv1.CapacityTypeLabelKey: capacityType})
+	nodeLabels := lo.Assign(nodeClaim.Labels, claimLabels, labels.GetAllSingleValuedRequirementLabels(instanceType.Requirements), map[string]string{
+		karpv1.CapacityTypeLabelKey: capacityType,
+		v1beta1.LabelPlacementScope: placementScope,
+		v1beta1.LabelUltraSSD:       fmt.Sprint(ultraSSD),
+	})
 	var modePtr *armcontainerservice.AgentPoolMode
 	if modeFromLabel, ok := nodeLabels["kubernetes.azure.com/mode"]; ok && modeFromLabel == "system" {
 		modePtr = lo.ToPtr(armcontainerservice.AgentPoolModeSystem)
@@ -255,10 +355,12 @@ func configureLabelsAndMode(nodeClaim *karpv1.NodeClaim, instanceType *corecloud
 	}
 
 	// TODO: also do the same for taints (which don't have sanitization logic like this yet)
-	// Remove all labels with kubernetes.azure.com prefix, as well as those managed by kubelet.
-	// Also remove legacy AKS managed labels
+	// Remove labels that shouldn't be sent to the API:
+	// - AKS-managed labels (kubernetes.azure.com/*) and legacy AKS labels
+	// - Kubelet-managed labels (set automatically by kubelet, e.g. hostname, zone)
+	// - Labels kubelet can't set (e.g. kubernetes.io/*, k8s.io/* outside allowed namespaces)
 	nodeLabels = lo.OmitBy(nodeLabels, func(key string, _ string) bool {
-		return v1beta1.IsAKSLabel(key) || labels.IsLabelKubeletManaged(key)
+		return v1beta1.IsAKSLabel(key) || labels.IsLabelKubeletManaged(key) || !labels.CanKubeletSetLabel(key)
 	})
 
 	nodeLabelPtrs := make(map[string]*string, len(nodeLabels))
@@ -327,6 +429,8 @@ func configureKubeletConfig(nodeClass *v1beta1.AKSNodeClass) *armcontainerservic
 		kubeletConfig.PodMaxPids = convertPodMaxPids(*nodeClass.Spec.Kubelet.PodPidsLimit)
 	}
 
+	kubeletConfig.FailSwapOn = nodeClass.Spec.Kubelet.FailSwapOn
+
 	return kubeletConfig
 }
 
@@ -339,11 +443,74 @@ func convertContainerLogMaxSizeToMB(containerLogMaxSize string) *int32 {
 	return customscriptsbootstrap.ConvertContainerLogMaxSizeToMB(containerLogMaxSize)
 }
 
+func convertSwapFileSizeToMB(swapFileSize string) *int32 {
+	// TODO: rename the utils below.
+	return customscriptsbootstrap.ConvertContainerLogMaxSizeToMB(swapFileSize)
+}
+
 func convertPodMaxPids(podPidsLimit int64) *int32 {
 	// TODO: move that code here instead, as AKS machine instances will be the main path forward
 	// Can move when other provision modes are removed too.
 	// Right now we are willing to call this just to avoid unnecessary code duplication.
 	return customscriptsbootstrap.ConvertPodMaxPids(lo.ToPtr(podPidsLimit))
+}
+
+func configureLinuxOSConfig(nodeClass *v1beta1.AKSNodeClass) *armcontainerservice.LinuxOSConfig {
+	if nodeClass == nil || nodeClass.Spec.LinuxOSConfig == nil {
+		return nil
+	}
+
+	linuxOSConfig := &armcontainerservice.LinuxOSConfig{}
+	if nodeClass.Spec.LinuxOSConfig.SwapFileSize != nil && *nodeClass.Spec.LinuxOSConfig.SwapFileSize != "" {
+		linuxOSConfig.SwapFileSizeMB = convertSwapFileSizeToMB(*nodeClass.Spec.LinuxOSConfig.SwapFileSize)
+	}
+	if nodeClass.Spec.LinuxOSConfig.TransparentHugePageDefrag != nil {
+		linuxOSConfig.TransparentHugePageDefrag = lo.ToPtr(string(*nodeClass.Spec.LinuxOSConfig.TransparentHugePageDefrag))
+	}
+	if nodeClass.Spec.LinuxOSConfig.TransparentHugePageEnabled != nil {
+		linuxOSConfig.TransparentHugePageEnabled = lo.ToPtr(string(*nodeClass.Spec.LinuxOSConfig.TransparentHugePageEnabled))
+	}
+	linuxOSConfig.Sysctls = configureSysctlConfig(nodeClass.Spec.LinuxOSConfig.Sysctls)
+
+	return linuxOSConfig
+}
+
+func configureSysctlConfig(sysctls *v1beta1.SysctlConfiguration) *armcontainerservice.SysctlConfig {
+	if sysctls == nil {
+		return nil
+	}
+
+	sysctlConfig := &armcontainerservice.SysctlConfig{}
+	sysctlConfig.FsAioMaxNr = sysctls.FsAioMaxNr
+	sysctlConfig.FsFileMax = sysctls.FsFileMax
+	sysctlConfig.FsInotifyMaxUserWatches = sysctls.FsInotifyMaxUserWatches
+	sysctlConfig.FsNrOpen = sysctls.FsNrOpen
+	sysctlConfig.KernelThreadsMax = sysctls.KernelThreadsMax
+	sysctlConfig.NetCoreNetdevMaxBacklog = sysctls.NetCoreNetdevMaxBacklog
+	sysctlConfig.NetCoreOptmemMax = sysctls.NetCoreOptmemMax
+	sysctlConfig.NetCoreRmemDefault = sysctls.NetCoreRmemDefault
+	sysctlConfig.NetCoreRmemMax = sysctls.NetCoreRmemMax
+	sysctlConfig.NetCoreSomaxconn = sysctls.NetCoreSomaxconn
+	sysctlConfig.NetCoreWmemDefault = sysctls.NetCoreWmemDefault
+	sysctlConfig.NetCoreWmemMax = sysctls.NetCoreWmemMax
+	sysctlConfig.NetIPv4IPLocalPortRange = sysctls.NetIPv4IPLocalPortRange
+	sysctlConfig.NetIPv4NeighDefaultGcThresh1 = sysctls.NetIPv4NeighDefaultGcThresh1
+	sysctlConfig.NetIPv4NeighDefaultGcThresh2 = sysctls.NetIPv4NeighDefaultGcThresh2
+	sysctlConfig.NetIPv4NeighDefaultGcThresh3 = sysctls.NetIPv4NeighDefaultGcThresh3
+	sysctlConfig.NetIPv4TCPFinTimeout = sysctls.NetIPv4TCPFinTimeout
+	sysctlConfig.NetIPv4TCPKeepaliveProbes = sysctls.NetIPv4TCPKeepaliveProbes
+	sysctlConfig.NetIPv4TCPKeepaliveTime = sysctls.NetIPv4TCPKeepaliveTime
+	sysctlConfig.NetIPv4TCPMaxSynBacklog = sysctls.NetIPv4TCPMaxSynBacklog
+	sysctlConfig.NetIPv4TCPMaxTwBuckets = sysctls.NetIPv4TCPMaxTwBuckets
+	sysctlConfig.NetIPv4TCPTwReuse = sysctls.NetIPv4TCPTwReuse
+	sysctlConfig.NetIPv4TcpkeepaliveIntvl = sysctls.NetIPv4TCPKeepaliveIntvl
+	sysctlConfig.NetNetfilterNfConntrackBuckets = sysctls.NetNetfilterNfConntrackBuckets
+	sysctlConfig.NetNetfilterNfConntrackMax = sysctls.NetNetfilterNfConntrackMax
+	sysctlConfig.VMMaxMapCount = sysctls.VMMaxMapCount
+	sysctlConfig.VMSwappiness = sysctls.VMSwappiness
+	sysctlConfig.VMVfsCachePressure = sysctls.VMVfsCachePressure
+
+	return sysctlConfig
 }
 
 // parseVMImageID parses a VM image ID and extracts the required components for custom OS image headers.

@@ -31,10 +31,10 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/patrickmn/go-cache"
 	"github.com/samber/lo"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -43,7 +43,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	karpapis "sigs.k8s.io/karpenter/pkg/apis"
-	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 
 	"sigs.k8s.io/karpenter/pkg/operator"
 	coreoptions "sigs.k8s.io/karpenter/pkg/operator/options"
@@ -61,18 +60,21 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance/machinecache"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instancetype"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/kubernetesversion"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/loadbalancer"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/networksecuritygroup"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/pricing"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/quota"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
 	armopts "github.com/Azure/karpenter-provider-azure/pkg/utils/clientopts"
+	"github.com/Azure/karpenter-provider-azure/pkg/utils/zones"
 )
 
 func init() {
-	karpv1.NormalizedLabels = lo.Assign(karpv1.NormalizedLabels, map[string]string{"topology.disk.csi.azure.com/zone": corev1.LabelTopologyZone})
+	zones.RegisterCSIZoneNormalization()
 }
 
 type Operator struct {
@@ -82,6 +84,11 @@ type Operator struct {
 	// of the cluster where the Karpenter pod is running. This is usually the same as operator.KubernetesInterface,
 	// but may be different if Karpenter is running in a different cluster than the one it manages.
 	InClusterKubernetesInterface kubernetes.Interface
+
+	// ManagedDynamicInterface is a dynamic client over the managed (workload) cluster, used
+	// by callers that need to inspect out-of-tree CRDs (e.g. Cilium / Calico NetworkPolicy)
+	// alongside the typed client on the embedded operator (operator.KubernetesInterface).
+	ManagedDynamicInterface dynamic.Interface
 
 	UnavailableOfferingsCache *azurecache.UnavailableOfferings
 
@@ -94,6 +101,7 @@ type Operator struct {
 	VMInstanceProvider        *instance.DefaultVMProvider
 	AKSMachineProvider        *instance.DefaultAKSMachineProvider
 	LoadBalancerProvider      *loadbalancer.Provider
+	QuotaProvider             *quota.DefaultProvider
 	AZClient                  *azclient.AZClient
 }
 
@@ -141,6 +149,16 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 	inClusterConfig.UserAgent = auth.GetUserAgentExtension()
 	inClusterClient := kubernetes.NewForConfigOrDie(inClusterConfig)
 
+	// Build a dynamic client over the managed (workload) cluster config. operator.GetConfig()
+	// is the rest.Config that controller-runtime uses for the manager, which targets the
+	// workload cluster (via mounted kubeconfig in CCP, or same as in-cluster in non-CCP).
+	// LocalDNS gate evaluation reads out-of-tree CRDs (Cilium / Calico NetworkPolicy) through
+	// this; the typed client lives on the embedded operator (operator.KubernetesInterface).
+	managedConfig := rest.CopyConfig(operator.GetConfig())
+	managedConfig.RateLimiter = flowcontrol.NewTokenBucketRateLimiter(float32(coreoptions.FromContext(ctx).KubeClientQPS), coreoptions.FromContext(ctx).KubeClientBurst)
+	managedConfig.UserAgent = auth.GetUserAgentExtension()
+	managedDynamicClient := dynamic.NewForConfigOrDie(managedConfig)
+
 	// A wrong DNSServiceIP breaks DNS on every node this controller creates.
 	if options.FromContext(ctx).DNSServiceIP == "" {
 		discoveredDNSIP, err := kubeDNSIP(ctx, operator.KubernetesInterface)
@@ -171,12 +189,14 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 		cache.New(imagefamily.ImageExpirationInterval,
 			imagefamily.ImageCacheCleaningInterval),
 	)
+	quotaProvider := quota.NewProvider(azClient.UsageClient, azConfig.Location)
 	instanceTypeProvider := instancetype.NewDefaultProvider(
 		azConfig.Location,
 		cache.New(instancetype.InstanceTypesCacheTTL, azurecache.DefaultCleanupInterval),
 		azClient.SKUClient,
 		pricingProvider,
 		unavailableOfferingsCache,
+		quotaProvider,
 	)
 
 	// Ensure we're able to hydrate instance types before starting any controllers
@@ -190,11 +210,16 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 		instanceTypeProvider,
 		azClient.NodeBootstrappingClient,
 	)
+	networkSecurityGroupProvider := networksecuritygroup.NewProvider(
+		azClient.NetworkSecurityGroupsClient,
+		options.FromContext(ctx).NodeResourceGroup,
+	)
 	launchTemplateProvider := launchtemplate.NewProvider(
 		ctx,
 		imageResolver,
 		imageProvider,
 		operator.KubernetesInterface,
+		networkSecurityGroupProvider,
 		lo.Must(getCABundle(operator.GetConfig())),
 		options.FromContext(ctx).ClusterEndpoint,
 		azConfig.TenantID,
@@ -208,10 +233,6 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 	loadBalancerProvider := loadbalancer.NewProvider(
 		azClient.LoadBalancersClient,
 		cache.New(loadbalancer.LoadBalancersCacheTTL, azurecache.DefaultCleanupInterval),
-		options.FromContext(ctx).NodeResourceGroup,
-	)
-	networkSecurityGroupProvider := networksecuritygroup.NewProvider(
-		azClient.NetworkSecurityGroupsClient,
 		options.FromContext(ctx).NodeResourceGroup,
 	)
 	allocationStrategyProvider := allocationstrategy.NewProvider()
@@ -230,6 +251,15 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 		options.FromContext(ctx).DiskEncryptionSetID,
 		env,
 	)
+
+	aksMachineCache := machinecache.New(
+		ctx,
+		azClient.AKSMachinesClient(),
+		azConfig.ResourceGroup,
+		options.FromContext(ctx).ClusterName,
+		options.FromContext(ctx).AKSMachinesPoolName,
+	)
+
 	aksMachineInstanceProvider := instance.NewAKSMachineProvider(
 		azClient,
 		instanceTypeProvider,
@@ -241,11 +271,14 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 		options.FromContext(ctx).ClusterName,
 		options.FromContext(ctx).AKSMachinesPoolName,
 		azConfig.Location,
+		options.FromContext(ctx).ProvisionMode == consts.ProvisionModeAKSMachineAPIHeaderBatch,
+		aksMachineCache,
 	)
 
 	return ctx, &Operator{
 		Operator:                     operator,
 		InClusterKubernetesInterface: inClusterClient,
+		ManagedDynamicInterface:      managedDynamicClient,
 		UnavailableOfferingsCache:    unavailableOfferingsCache,
 		KubernetesVersionProvider:    kubernetesVersionProvider,
 		ImageProvider:                imageProvider,
@@ -256,6 +289,7 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 		VMInstanceProvider:           vmInstanceProvider,
 		AKSMachineProvider:           aksMachineInstanceProvider,
 		LoadBalancerProvider:         loadBalancerProvider,
+		QuotaProvider:                quotaProvider,
 		AZClient:                     azClient,
 	}
 }

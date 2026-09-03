@@ -17,32 +17,36 @@ limitations under the License.
 package fake
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v8"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v9"
 	"github.com/Azure/karpenter-provider-azure/pkg/consts"
-	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient"
+	fakesync "github.com/Azure/karpenter-provider-azure/pkg/fake/sync"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient/aksmachinesheaderbatch"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient/azapi"
 	"github.com/samber/lo"
 )
 
 // AKSDataStorage contains the shared data stores for both AKS agent pools and machines
 type AKSDataStorage struct {
-	AgentPools  *sync.Map
-	AKSMachines *sync.Map
+	AgentPools  *fakesync.Map[string, armcontainerservice.AgentPool]
+	AKSMachines *fakesync.Map[string, armcontainerservice.Machine]
 }
 
 // NewAKSDataStorage creates a new instance of shared data stores
 func NewAKSDataStorage() *AKSDataStorage {
 	return &AKSDataStorage{
-		AgentPools:  &sync.Map{},
-		AKSMachines: &sync.Map{},
+		AgentPools:  &fakesync.Map[string, armcontainerservice.AgentPool]{},
+		AKSMachines: &fakesync.Map[string, armcontainerservice.Machine]{},
 	}
 }
 
@@ -75,6 +79,13 @@ type AKSMachinesBehavior struct {
 	AKSMachineGetBehavior              MockedFunction[AKSMachineGetInput, armcontainerservice.MachinesClientGetResponse]
 	AKSMachineNewListPagerBehavior     MockedFunction[AKSMachineListInput, *runtime.Pager[armcontainerservice.MachinesClientListResponse]]
 	AfterPollProvisioningErrorOverride *armcontainerservice.ErrorDetail
+
+	// BatchMachineErrorFunc, if set, is called during batch creation to determine per-machine
+	// errors. It receives a machine name and returns an error code and message; if the error code
+	// is non-empty, the machine is treated as failed. Machines with empty error code succeed.
+	// When any per-machine errors are returned, the fake produces a batch error response
+	// (BatchMachineClientError or BatchMachineInternalServerError) matching the real Azure API format.
+	BatchMachineErrorFunc func(machineName string) (errorCode string, errorMessage string)
 }
 
 var AKSMachineAPIErrorFromAKSMachineNotFound = &azcore.ResponseError{
@@ -91,6 +102,30 @@ var AKSMachineAPIErrorFromAKSMachineImmutablePropertyChangeAttempted = &azcore.R
 }
 var AKSMachineAPIErrorAny = &azcore.ResponseError{
 	ErrorCode: "SomeRandomError",
+}
+
+func AKSMachineAPIErrorVMSizeNotSupported(vmSize, subscription, location string) *azcore.ResponseError {
+	message := fmt.Sprintf("Virtual Machine size: '%s' is not supported for subscription %s in location '%s'. Please refer to aka.ms/aks/vm-size-selector to find supported VM sizes in location '%s'.", vmSize, subscription, location, location)
+	return newResponseError("VMSizeNotSupported", http.StatusBadRequest, message)
+}
+
+func AKSMachineAPIErrorVMSizeNotSupportedBadRequest(vmSize, subscription, location string) *azcore.ResponseError {
+	message := fmt.Sprintf("Virtual Machine size: '%s' is not supported for subscription %s in location '%s'. Please refer to aka.ms/aks/vm-size-selector to find supported VM sizes in location '%s'.", vmSize, subscription, location, location)
+	return newResponseError("BadRequest", http.StatusBadRequest, message)
+}
+
+// statusCode is always BadRequest today but kept as a parameter for generality
+func newResponseError(errorCode string, statusCode int, message string) *azcore.ResponseError {
+	errorBody := fmt.Sprintf(`{"code": "%s", "message": "%s"}`, errorCode, message)
+	return &azcore.ResponseError{
+		ErrorCode:  errorCode,
+		StatusCode: statusCode,
+		RawResponse: &http.Response{
+			StatusCode: statusCode,
+			Status:     fmt.Sprintf("%d %s", statusCode, http.StatusText(statusCode)),
+			Body:       io.NopCloser(strings.NewReader(errorBody)),
+		},
+	}
 }
 
 func AKSMachineAPIProvisioningErrorSkuNotAvailable(sku string, location string) *armcontainerservice.ErrorDetail {
@@ -214,7 +249,7 @@ func AKSMachineAPIProvisioningErrorAny() *armcontainerservice.ErrorDetail {
 }
 
 // assert that the fake implements the interface
-var _ azclient.AKSMachinesAPI = &AKSMachinesAPI{}
+var _ azapi.AKSMachinesAPI = &AKSMachinesAPI{}
 
 type AKSMachinesAPI struct {
 	AKSMachinesBehavior
@@ -233,11 +268,9 @@ func (c *AKSMachinesAPI) Reset() {
 	c.AKSMachineCreateOrUpdateBehavior.Reset()
 	c.AKSMachineGetBehavior.Reset()
 	c.AKSMachineNewListPagerBehavior.Reset()
-	c.aksDataStorage.AKSMachines.Range(func(k, v any) bool {
-		c.aksDataStorage.AKSMachines.Delete(k)
-		return true
-	})
+	c.aksDataStorage.AKSMachines.Clear()
 	c.AfterPollProvisioningErrorOverride = nil
+	c.BatchMachineErrorFunc = nil
 }
 
 func (c *AKSMachinesAPI) BeginCreateOrUpdate(
@@ -257,20 +290,33 @@ func (c *AKSMachinesAPI) BeginCreateOrUpdate(
 		AKSMachine:        parameters,
 		Options:           options,
 	}
-	aksMachine := input.AKSMachine
-	id := MkMachineID(input.ResourceGroupName, input.ResourceName, input.AgentPoolName, input.AKSMachineName)
-	aksMachine.ID = &id
-	aksMachine.Name = &input.AKSMachineName
 
 	// Validate parent AgentPool
 	if !c.doesAgentPoolExists(input.ResourceGroupName, input.ResourceName, input.AgentPoolName) {
 		return nil, AKSMachineAPIErrorFromAKSMachinesPoolNotFound
 	}
 
+	// If batch entries are present, create a machine for each entry.
+	// This simulates what the real Azure API does when it reads the BatchPutMachine header.
+	if entries := aksmachinesheaderbatch.FakeBatchEntriesFromContext(ctx); len(entries) > 0 {
+		return c.createBatchMachines(input, parameters, entries)
+	}
+
+	// Non-batch path: single machine creation (original behavior)
+	return c.createSingleMachine(input, parameters)
+}
+
+// createSingleMachine handles non-batch (single machine) creation.
+func (c *AKSMachinesAPI) createSingleMachine(input *AKSMachineCreateOrUpdateInput, parameters armcontainerservice.Machine) (*runtime.Poller[armcontainerservice.MachinesClientCreateOrUpdateResponse], error) {
+	aksMachine := deepCopyMachine(parameters)
+	id := MkMachineID(input.ResourceGroupName, input.ResourceName, input.AgentPoolName, input.AKSMachineName)
+	aksMachine.ID = &id
+	aksMachine.Name = &input.AKSMachineName
+
 	// Check if AKS machine already exists, if so, consider this an update than a create
 	existingMachine, ok := c.aksDataStorage.AKSMachines.Load(id)
 	if ok {
-		return c.updateExistingAKSMachine(input, existingMachine.(armcontainerservice.Machine), aksMachine)
+		return c.updateExistingAKSMachine(input, existingMachine, aksMachine)
 	}
 
 	// Default values + update status, for sync phase
@@ -284,6 +330,189 @@ func (c *AKSMachinesAPI) BeginCreateOrUpdate(
 		c.aksDataStorage.AKSMachines.Store(id, updatedAKSMachine)
 		return &armcontainerservice.MachinesClientCreateOrUpdateResponse{Machine: updatedAKSMachine}, pollingError
 	})
+}
+
+// createBatchMachines handles batch creation: creates one machine per entry
+// using the shared template body + per-machine zones/tags from the batch entries.
+// This simulates what the real Azure API does when reading the BatchPutMachine header.
+//
+// If BatchMachineErrorFunc is set, it is called for each machine to determine per-machine
+// errors. Failed machines are NOT created; successful machines are stored normally.
+// The error response matches the real Azure batch API format:
+//   - If any client error (4xx-style code) is present: returns 400 BatchMachineClientError
+//   - If only internal errors (5xx-style): returns 500 BatchMachineInternalServerError
+//   - If all succeed: returns success as before
+func (c *AKSMachinesAPI) createBatchMachines(input *AKSMachineCreateOrUpdateInput, template armcontainerservice.Machine, entries []aksmachinesheaderbatch.MachineEntry) (*runtime.Poller[armcontainerservice.MachinesClientCreateOrUpdateResponse], error) {
+	// Collect per-machine errors if the error function is set
+	var perMachineErrors []fakeBatchMachineError
+	failedMachines := make(map[string]bool)
+
+	if c.BatchMachineErrorFunc != nil {
+		for _, entry := range entries {
+			code, msg := c.BatchMachineErrorFunc(entry.MachineName)
+			if code != "" {
+				perMachineErrors = append(perMachineErrors, fakeBatchMachineError{
+					code:    code,
+					message: msg,
+					target:  entry.MachineName,
+				})
+				failedMachines[entry.MachineName] = true
+			}
+		}
+	}
+
+	var primaryMachine armcontainerservice.Machine
+
+	for i, entry := range entries {
+		if failedMachines[entry.MachineName] {
+			continue
+		}
+
+		machine, err := c.createOneBatchMachine(input, template, entry)
+		if err != nil {
+			return nil, err
+		}
+
+		if i == 0 || primaryMachine.ID == nil {
+			primaryMachine = machine
+		}
+	}
+
+	// If there are per-machine errors, build and return a batch error response
+	if len(perMachineErrors) > 0 {
+		return nil, buildFakeBatchError(perMachineErrors)
+	}
+
+	// Enrich input.AKSMachine with the primary entry's zones/tags so that
+	// CalledWithInput captures meaningful per-machine data (not the cleared template).
+	input.AKSMachine = primaryMachine
+
+	// Return the poller for the primary (first) machine, matching coordinator behavior
+	return c.AKSMachineCreateOrUpdateBehavior.Invoke(input, func(input *AKSMachineCreateOrUpdateInput) (*armcontainerservice.MachinesClientCreateOrUpdateResponse, error) {
+		return &armcontainerservice.MachinesClientCreateOrUpdateResponse{Machine: primaryMachine}, nil
+	})
+}
+
+// createOneBatchMachine builds and stores a single machine from a batch entry.
+func (c *AKSMachinesAPI) createOneBatchMachine(input *AKSMachineCreateOrUpdateInput, template armcontainerservice.Machine, entry aksmachinesheaderbatch.MachineEntry) (armcontainerservice.Machine, error) {
+	machine := template
+	// Shallow-copy Properties to avoid mutating the shared template across loop iterations.
+	if machine.Properties != nil {
+		props := *machine.Properties
+		machine.Properties = &props
+	}
+	machine.Name = lo.ToPtr(entry.MachineName)
+	id := MkMachineID(input.ResourceGroupName, input.ResourceName, input.AgentPoolName, entry.MachineName)
+	machine.ID = &id
+
+	// Apply per-machine zones from the batch entry
+	if len(entry.Zones) > 0 {
+		zones := make([]*string, len(entry.Zones))
+		for j := range entry.Zones {
+			zones[j] = lo.ToPtr(entry.Zones[j])
+		}
+		machine.Zones = zones
+	}
+
+	// Apply per-machine tags from the batch entry
+	if len(entry.Tags) > 0 {
+		if machine.Properties == nil {
+			machine.Properties = &armcontainerservice.MachineProperties{}
+		}
+		tags := make(map[string]*string, len(entry.Tags))
+		for k, v := range entry.Tags {
+			tags[k] = lo.ToPtr(v)
+		}
+		machine.Properties.Tags = tags
+	}
+
+	// Check if AKS machine already exists — if so, check for immutable property conflicts
+	if existing, ok := c.aksDataStorage.AKSMachines.Load(id); ok {
+		if c.doImmutablePropertiesChanged(&existing, &machine) {
+			return armcontainerservice.Machine{}, AKSMachineAPIErrorFromAKSMachineImmutablePropertyChangeAttempted
+		}
+	}
+
+	c.setDefaultMachineValues(&machine, input.ResourceGroupName, input.AgentPoolName)
+	machine.Properties.ProvisioningState = lo.ToPtr("Creating")
+	c.aksDataStorage.AKSMachines.Store(id, machine)
+
+	updatedMachine, _ := c.simulateCreateStatusAtAsync(machine)
+	c.aksDataStorage.AKSMachines.Store(id, updatedMachine)
+
+	return updatedMachine, nil
+}
+
+// fakeBatchMachineError represents a per-machine error for building fake batch error responses.
+type fakeBatchMachineError struct {
+	code    string
+	message string
+	target  string
+}
+
+// batchErrorDetailJSON is the JSON shape for a per-machine error detail in batch API responses.
+type batchErrorDetailJSON struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	Target  string `json:"target"`
+}
+
+// buildFakeBatchError constructs an *azcore.ResponseError matching the real Azure batch error format.
+// Mimics the JoinBatchPutMachineErrors logic tested in the wiki:
+//   - If any error code looks like a client error → 400 BatchMachineClientError with details[] at top level
+//   - If only internal errors → 500 BatchMachineInternalServerError with details[] JSON-encoded in message
+func buildFakeBatchError(errors []fakeBatchMachineError) *azcore.ResponseError {
+	details := make([]batchErrorDetailJSON, len(errors))
+	hasClientError := false
+	for i, e := range errors {
+		details[i] = batchErrorDetailJSON{Code: e.code, Message: e.message, Target: e.target}
+		// Client errors are non-Internal* codes (e.g., InvalidParameter, SkuNotAvailable, etc.)
+		if !strings.HasPrefix(e.code, "Internal") {
+			hasClientError = true
+		}
+	}
+
+	var bodyJSON []byte
+	var statusCode int
+	var errorCode string
+
+	if hasClientError {
+		statusCode = http.StatusBadRequest
+		errorCode = "BatchMachineClientError"
+		body := struct {
+			Code    string                 `json:"code"`
+			Message string                 `json:"message"`
+			Details []batchErrorDetailJSON `json:"details"`
+		}{
+			Code:    errorCode,
+			Message: "batch client error",
+			Details: details,
+		}
+		bodyJSON, _ = json.Marshal(body)
+	} else {
+		statusCode = http.StatusInternalServerError
+		errorCode = "BatchMachineInternalServerError"
+		innerJSON, _ := json.Marshal(struct {
+			Details []batchErrorDetailJSON `json:"details"`
+		}{Details: details})
+		body := struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		}{
+			Code:    errorCode,
+			Message: string(innerJSON),
+		}
+		bodyJSON, _ = json.Marshal(body)
+	}
+
+	return &azcore.ResponseError{
+		ErrorCode:  errorCode,
+		StatusCode: statusCode,
+		RawResponse: &http.Response{
+			StatusCode: statusCode,
+			Body:       io.NopCloser(bytes.NewReader(bodyJSON)),
+		},
+	}
 }
 
 func (c *AKSMachinesAPI) updateExistingAKSMachine(input *AKSMachineCreateOrUpdateInput, existing armcontainerservice.Machine, aksMachine armcontainerservice.Machine) (*runtime.Poller[armcontainerservice.MachinesClientCreateOrUpdateResponse], error) {
@@ -365,7 +594,7 @@ func (c *AKSMachinesAPI) Get(
 		aksMachine, ok := c.aksDataStorage.AKSMachines.Load(MkMachineID(input.ResourceGroupName, input.ResourceName, input.AgentPoolName, input.AKSMachineName))
 		if ok {
 			return armcontainerservice.MachinesClientGetResponse{
-				Machine: aksMachine.(armcontainerservice.Machine),
+				Machine: aksMachine,
 			}, nil
 		} else {
 			return armcontainerservice.MachinesClientGetResponse{}, AKSMachineAPIErrorFromAKSMachineNotFound
@@ -401,10 +630,8 @@ func (c *AKSMachinesAPI) NewListPager(
 				var aksMachines []*armcontainerservice.Machine
 				expectedIDPrefix := fmt.Sprintf("/subscriptions/subscriptionID/resourceGroups/%s/providers/Microsoft.ContainerService/managedClusters/%s/agentPools/%s/machines/",
 					input.ResourceGroupName, input.ResourceName, input.AgentPoolName)
-				c.aksDataStorage.AKSMachines.Range(func(key, value any) bool {
-					machineID := key.(string)
+				c.aksDataStorage.AKSMachines.Range(func(machineID string, aksMachine armcontainerservice.Machine) bool {
 					if strings.HasPrefix(machineID, expectedIDPrefix) {
-						aksMachine := value.(armcontainerservice.Machine)
 						aksMachines = append(aksMachines, &aksMachine)
 					}
 					return true
@@ -516,4 +743,18 @@ func (c *AKSMachinesAPI) setDefaultMachineValues(machine *armcontainerservice.Ma
 	if machine.Properties.ETag == nil {
 		machine.Properties.ETag = lo.ToPtr(fmt.Sprintf(`"etag-%d"`, time.Now().UnixNano()))
 	}
+}
+
+// deepCopyMachine returns a fully independent copy of an AKS Machine via JSON
+// round-trip, simulating the serialization boundary of a real HTTP call.
+func deepCopyMachine(src armcontainerservice.Machine) armcontainerservice.Machine {
+	data, err := json.Marshal(src)
+	if err != nil {
+		panic(fmt.Sprintf("fake: failed to marshal Machine for deep copy: %v", err))
+	}
+	var dst armcontainerservice.Machine
+	if err := json.Unmarshal(data, &dst); err != nil {
+		panic(fmt.Sprintf("fake: failed to unmarshal Machine for deep copy: %v", err))
+	}
+	return dst
 }

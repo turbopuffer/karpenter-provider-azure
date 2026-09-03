@@ -53,6 +53,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/loadbalancer"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/networksecuritygroup"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
+	"github.com/Azure/karpenter-provider-azure/pkg/utils/zones"
 )
 
 var (
@@ -72,6 +73,10 @@ var (
 	VMPriorityToScaleSetPriority = map[armcompute.VirtualMachinePriorityTypes]string{
 		armcompute.VirtualMachinePriorityTypesSpot:    v1beta1.ScaleSetPrioritySpot,
 		armcompute.VirtualMachinePriorityTypesRegular: v1beta1.ScaleSetPriorityRegular,
+	}
+	VMPriorityToPriority = map[armcompute.VirtualMachinePriorityTypes]string{
+		armcompute.VirtualMachinePriorityTypesSpot:    v1beta1.PrioritySpot,
+		armcompute.VirtualMachinePriorityTypesRegular: v1beta1.PriorityRegular,
 	}
 
 	aksIdentifyingExtensionEnvs = sets.New(
@@ -235,7 +240,7 @@ func (p *DefaultVMProvider) BeginCreate(
 		return nil, err
 	}
 	vm := vmPromise.VM
-	zone, err := utils.MakeAKSLabelZoneFromVM(vm)
+	zone, err := zones.MakeAKSLabelZoneFromVM(vm)
 	if err != nil {
 		log.FromContext(ctx).V(1).Info("failed to get zone for VM", "vmName", *vm.Name, "error", err)
 	}
@@ -302,11 +307,7 @@ func (p *DefaultVMProvider) Update(ctx context.Context, vmName string, update ar
 		}
 
 		for extName, poller := range pollers {
-			// Poll more frequently than the default of 30s
-			opts := &runtime.PollUntilDoneOptions{
-				Frequency: 3 * time.Second,
-			}
-			_, err := poller.PollUntilDone(ctx, opts)
+			_, err := poller.PollUntilDone(ctx, defaultPollerOptions())
 			if err != nil {
 				return fmt.Errorf("polling VM extension %q for VM %q: %w", extName, vmName, err)
 			}
@@ -550,6 +551,7 @@ type createVMOptions struct {
 	UseSIG              bool
 	DiskEncryptionSetID string
 	NodePoolName        string
+	UltraSSDEnabled     bool
 }
 
 // newVMObject creates a new armcompute.VirtualMachine from the provided options
@@ -605,7 +607,7 @@ func newVMObject(opts *createVMOptions) *armcompute.VirtualMachine {
 			},
 			Priority: lo.ToPtr(KarpCapacityTypeToVMPriority[opts.CapacityType]),
 		},
-		Zones: utils.MakeARMZonesFromAKSLabelZone(opts.Zone),
+		Zones: zones.MakeARMZonesFromAKSLabelZone(opts.Zone),
 		Tags:  opts.LaunchTemplate.Tags,
 	}
 	setVMPropertiesOSDiskType(vm.Properties, opts.LaunchTemplate)
@@ -613,6 +615,7 @@ func newVMObject(opts *createVMOptions) *armcompute.VirtualMachine {
 	setImageReference(vm.Properties, opts.LaunchTemplate.ImageID, opts.UseSIG)
 	setVMPropertiesBillingProfile(vm.Properties, opts.CapacityType)
 	setVMPropertiesSecurityProfile(vm.Properties, opts.NodeClass)
+	setVMPropertiesAdditionalCapabilities(vm.Properties, opts.UltraSSDEnabled)
 
 	if opts.ProvisionMode == consts.ProvisionModeBootstrappingClient {
 		vm.Properties.OSProfile.CustomData = lo.ToPtr(opts.LaunchTemplate.CustomScriptsCustomData)
@@ -669,11 +672,41 @@ func setVMPropertiesBillingProfile(vmProperties *armcompute.VirtualMachineProper
 }
 
 func setVMPropertiesSecurityProfile(vmProperties *armcompute.VirtualMachineProperties, nodeClass *v1beta1.AKSNodeClass) {
-	if nodeClass.Spec.Security != nil && nodeClass.Spec.Security.EncryptionAtHost != nil {
+	if nodeClass.Spec.Security == nil {
+		return
+	}
+
+	if nodeClass.Spec.Security.EncryptionAtHost != nil {
 		if vmProperties.SecurityProfile == nil {
 			vmProperties.SecurityProfile = &armcompute.SecurityProfile{}
 		}
 		vmProperties.SecurityProfile.EncryptionAtHost = nodeClass.Spec.Security.EncryptionAtHost
+	}
+
+	if nodeClass.IsTrustedLaunchEnabled() {
+		if vmProperties.SecurityProfile == nil {
+			vmProperties.SecurityProfile = &armcompute.SecurityProfile{}
+		}
+
+		if vmProperties.SecurityProfile.SecurityType == nil {
+			vmProperties.SecurityProfile.SecurityType = lo.ToPtr(armcompute.SecurityTypesTrustedLaunch)
+		}
+
+		if vmProperties.SecurityProfile.UefiSettings == nil {
+			vmProperties.SecurityProfile.UefiSettings = &armcompute.UefiSettings{
+				SecureBootEnabled: lo.ToPtr(nodeClass.IsSecureBootEnabled()),
+				VTpmEnabled:       lo.ToPtr(nodeClass.IsVTPMEnabled()),
+			}
+		}
+	}
+}
+
+func setVMPropertiesAdditionalCapabilities(vmProperties *armcompute.VirtualMachineProperties, ultraSSDEnabled bool) {
+	if ultraSSDEnabled {
+		if vmProperties.AdditionalCapabilities == nil {
+			vmProperties.AdditionalCapabilities = &armcompute.AdditionalCapabilities{}
+		}
+		vmProperties.AdditionalCapabilities.UltraSSDEnabled = &ultraSSDEnabled
 	}
 }
 
@@ -730,6 +763,18 @@ func (p *DefaultVMProvider) createVirtualMachine(ctx context.Context, opts *crea
 	return &createResult{Poller: poller, VM: vm}, nil
 }
 
+func resolveUltraSSDRequested(nodeClaim *karpv1.NodeClaim) bool {
+	reqs := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)
+
+	compatibleWithTrue := reqs.Compatible(scheduling.NewRequirements(
+		scheduling.NewRequirement(v1beta1.LabelUltraSSD, v1.NodeSelectorOpIn, "true"))) == nil
+	compatibleWithFalse := reqs.Compatible(scheduling.NewRequirements(
+		scheduling.NewRequirement(v1beta1.LabelUltraSSD, v1.NodeSelectorOpIn, "false"))) == nil
+
+	// We only enable if the NodeClaim is explicitly requesting it. Ambiguous or unspecified requests result in false.
+	return compatibleWithTrue && !compatibleWithFalse
+}
+
 // beginLaunchInstance starts the launch of a VM instance.
 // The returned VirtualMachinePromise must be called to gather any errors
 // that are retrieved during async provisioning, as well as to complete the provisioning process.
@@ -741,17 +786,21 @@ func (p *DefaultVMProvider) beginLaunchInstance(
 	nodeClaim *karpv1.NodeClaim,
 	instanceTypes []*corecloudprovider.InstanceType,
 ) (*VirtualMachinePromise, error) {
-	instanceOfferings := p.allocationStrategyProvider.FilterInstanceOfferings(
+	selection := p.allocationStrategyProvider.Allocate(
 		ctx,
-		allocationstrategy.NewInstanceOfferings(instanceTypes),
+		instanceTypes,
 		scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...),
 	)
-
-	instanceType, capacityType, zone := offerings.PickSkuSizePriorityAndZone(ctx, instanceOfferings)
-	if instanceType == nil {
+	if selection == nil {
 		return nil, corecloudprovider.NewInsufficientCapacityError(fmt.Errorf("no instance types available"))
 	}
-	launchTemplate, err := p.getLaunchTemplate(ctx, nodeClass, nodeClaim, instanceType, capacityType)
+	instanceType := selection.InstanceType
+	capacityType := selection.CapacityType()
+
+	ultraSSD := resolveUltraSSDRequested(nodeClaim)
+	zone := selection.Zone()
+	placementScope := selection.PlacementScope()
+	launchTemplate, err := p.getLaunchTemplate(ctx, nodeClass, nodeClaim, instanceType, capacityType, placementScope, ultraSSD)
 	if err != nil {
 		return nil, fmt.Errorf("getting launch template: %w", err)
 	}
@@ -783,19 +832,30 @@ func (p *DefaultVMProvider) beginLaunchInstance(
 	// TODO: doing so would bypass the capacity and other errors that are currently handled by
 	// TODO: core pkg/controllers/nodeclaim/lifecycle/controller.go - in particular, there are metrics/events
 	// TODO: emitted in capacity failure cases that we probably want.
-	nicReference, err := p.createNetworkInterface(
-		ctx,
-		&createNICOptions{
-			NICName:                resourceName,
-			NetworkPlugin:          networkPlugin,
-			NetworkPluginMode:      networkPluginMode,
-			MaxPods:                utils.GetMaxPods(nodeClass, networkPlugin, networkPluginMode),
-			LaunchTemplate:         launchTemplate,
-			BackendPools:           backendPools,
-			InstanceType:           instanceType,
-			NetworkSecurityGroupID: nsgID,
-		},
-	)
+	nicOpts := &createNICOptions{
+		NICName:                resourceName,
+		NetworkPlugin:          networkPlugin,
+		NetworkPluginMode:      networkPluginMode,
+		MaxPods:                utils.GetMaxPods(nodeClass, networkPlugin, networkPluginMode),
+		LaunchTemplate:         launchTemplate,
+		BackendPools:           backendPools,
+		InstanceType:           instanceType,
+		NetworkSecurityGroupID: nsgID,
+	}
+
+	nicReference, err := p.createNetworkInterface(ctx, nicOpts)
+	if err != nil && isMissingSubmittedBackendPool(err, backendPools) {
+		log.FromContext(ctx).Info("network interface creation failed due to stale load balancer backend pool reference, refreshing",
+			"nicName", resourceName,
+			"error", err)
+		refreshedPools, refreshErr := p.loadBalancerProvider.RefreshBackendPools(ctx, backendPools)
+		if refreshErr != nil {
+			return nil, fmt.Errorf("refreshing backend pools after network interface failure: %w", refreshErr)
+		}
+		nicOpts.BackendPools = refreshedPools
+		// Try again
+		nicReference, err = p.createNetworkInterface(ctx, nicOpts)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -816,6 +876,7 @@ func (p *DefaultVMProvider) beginLaunchInstance(
 		UseSIG:              options.FromContext(ctx).UseSIG,
 		DiskEncryptionSetID: p.diskEncryptionSetID,
 		NodePoolName:        nodeClaim.Labels[karpv1.NodePoolLabelKey],
+		UltraSSDEnabled:     ultraSSD,
 	})
 	if err != nil {
 		sku, skuErr := p.instanceTypeProvider.Get(ctx, instanceType.Name)
@@ -850,7 +911,7 @@ func (p *DefaultVMProvider) beginLaunchInstance(
 				return nil
 			}
 
-			_, err = result.Poller.PollUntilDone(ctx, nil)
+			_, err = result.Poller.PollUntilDone(ctx, defaultPollerOptions())
 			if err != nil {
 				VMCreateFailureMetric.With(map[string]string{
 					metrics.ImageLabel:        launchTemplate.ImageID,
@@ -910,23 +971,25 @@ func (p *DefaultVMProvider) getLaunchTemplate(
 	nodeClaim *karpv1.NodeClaim,
 	instanceType *corecloudprovider.InstanceType,
 	capacityType string,
+	placementScope string,
+	ultraSSD bool,
 ) (*launchtemplate.Template, error) {
 	// We need to get all single-valued requirement labels from the instance type and the nodeClaim to pass down to kubelet.
 	// We don't just include single-value labels from the instance type because in the case where the label is NOT single-value on the instance
 	// (i.e. there are options), the nodeClaim may have selected one of those options via its requirements which we want to include.
 
-	// These may contain restricted labels from the pod that we need to filter out. We don't bother filtering the instance type requirements below because
-	// we know those can't be restricted since they're controlled by the provider and none use the kubernetes.io domain.
-	claimLabels := labels.GetFilteredSingleValuedRequirementLabels(
+	// These may contain restricted labels from the pod that we need to filter out; that's done in getStaticParameters.
+	claimLabels := labels.GetAllSingleValuedRequirementLabels(
 		scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...),
-		func(k string, req *scheduling.Requirement) bool {
-			return labels.CanKubeletSetLabel(k)
-		},
 	)
 	additionalLabels := lo.Assign(
 		claimLabels,
 		labels.GetAllSingleValuedRequirementLabels(instanceType.Requirements),
-		map[string]string{karpv1.CapacityTypeLabelKey: capacityType},
+		map[string]string{
+			karpv1.CapacityTypeLabelKey: capacityType,
+			v1beta1.LabelPlacementScope: placementScope,
+			v1beta1.LabelUltraSSD:       fmt.Sprint(ultraSSD),
+		},
 	)
 
 	launchTemplate, err := p.launchTemplateProvider.GetTemplate(ctx, nodeClass, nodeClaim, instanceType, additionalLabels)
@@ -999,14 +1062,15 @@ func (p *DefaultVMProvider) deleteVirtualMachine(ctx context.Context, vmName str
 		return err
 	}
 
-	_, err = poller.PollUntilDone(ctx, nil)
-
+	_, err = poller.PollUntilDone(ctx, defaultPollerOptions())
 	if err != nil {
 		if sdkerrors.IsNotFoundErr(err) {
 			return nil
 		}
+
 		return err
 	}
+
 	return nil
 }
 
@@ -1094,4 +1158,18 @@ func GetScaleSetPriorityLabelFromVM(vm *armcompute.VirtualMachine) string {
 		return VMPriorityToScaleSetPriority[*vm.Properties.Priority]
 	}
 	return ""
+}
+
+func GetPriorityLabelFromVM(vm *armcompute.VirtualMachine) string {
+	if vm != nil && vm.Properties != nil && vm.Properties.Priority != nil {
+		return VMPriorityToPriority[*vm.Properties.Priority]
+	}
+	return ""
+}
+
+func GetUltraSSDEnabled(vm *armcompute.VirtualMachine) bool {
+	if vm != nil && vm.Properties != nil && vm.Properties.AdditionalCapabilities != nil {
+		return lo.FromPtr(vm.Properties.AdditionalCapabilities.UltraSSDEnabled)
+	}
+	return false
 }

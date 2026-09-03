@@ -36,6 +36,7 @@ import (
 	coretest "sigs.k8s.io/karpenter/pkg/test"
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
+	"github.com/Azure/karpenter-provider-azure/pkg/utils/zones"
 	"github.com/Azure/karpenter-provider-azure/test/pkg/debug"
 	"github.com/Azure/karpenter-provider-azure/test/pkg/environment/azure"
 	"github.com/Azure/karpenter-provider-azure/test/pkg/environment/common"
@@ -128,7 +129,8 @@ var _ = Describe("Consolidation", Ordered, func() {
 		})
 		It("should update lastPodEventTime when pods go terminal", func() {
 			podLabels := map[string]string{"app": "regular-app"}
-			pod := coretest.Pod(coretest.PodOptions{
+			// Use a pod template in a Job because the test needs the workload pod to go terminal.
+			pod := env.Pod(coretest.PodOptions{
 				// use a non-pause image so that we can have a sleep
 				Image:   "alpine:3.20.2",
 				Command: []string{"/bin/sh", "-c", "sleep 30"},
@@ -246,11 +248,9 @@ var _ = Describe("Consolidation", Ordered, func() {
 
 			nodePool = coretest.ReplaceRequirements(nodePool,
 				karpv1.NodeSelectorRequirementWithMinValues{
-					NodeSelectorRequirement: corev1.NodeSelectorRequirement{
-						Key:      v1beta1.LabelSKUCPU,
-						Operator: corev1.NodeSelectorOpIn,
-						Values:   []string{"8"},
-					},
+					Key:      v1beta1.LabelSKUCPU,
+					Operator: corev1.NodeSelectorOpIn,
+					Values:   []string{"8"},
 				},
 			)
 			// We're expecting to create 3 nodes, so we'll expect to see at most 2 nodes deleting at one time.
@@ -308,18 +308,14 @@ var _ = Describe("Consolidation", Ordered, func() {
 
 			nodePool = coretest.ReplaceRequirements(nodePool,
 				karpv1.NodeSelectorRequirementWithMinValues{
-					NodeSelectorRequirement: corev1.NodeSelectorRequirement{
-						Key:      v1beta1.LabelSKUCPU,
-						Operator: corev1.NodeSelectorOpIn,
-						Values:   []string{"4", "8"},
-					},
+					Key:      v1beta1.LabelSKUCPU,
+					Operator: corev1.NodeSelectorOpIn,
+					Values:   []string{"4", "8"},
 				},
 				// Add an Exists operator so that we can select on a fake partition later
 				karpv1.NodeSelectorRequirementWithMinValues{
-					NodeSelectorRequirement: corev1.NodeSelectorRequirement{
-						Key:      "test-partition",
-						Operator: corev1.NodeSelectorOpExists,
-					},
+					Key:      "test-partition",
+					Operator: corev1.NodeSelectorOpExists,
 				},
 			)
 			nodePool.Labels = appLabels
@@ -436,7 +432,7 @@ var _ = Describe("Consolidation", Ordered, func() {
 			env.ExpectCreated(nodeClass, nodePool, dep)
 
 			env.EventuallyExpectCreatedNodeClaimCount("==", 5)
-			env.EventuallyExpectCreatedNodeCount("==", 5)
+			nodes := env.EventuallyExpectCreatedNodeCount("==", 5)
 			env.EventuallyExpectHealthyPodCount(selector, int(numPods))
 
 			dep.Spec.Replicas = lo.ToPtr[int32](1)
@@ -444,7 +440,7 @@ var _ = Describe("Consolidation", Ordered, func() {
 			// Update the deployment to only contain 1 replica.
 			env.ExpectUpdated(dep)
 
-			env.ConsistentlyExpectNoDisruptions(5, time.Minute)
+			env.ConsistentlyExpectNodesNotDisrupted(nodes, time.Minute)
 		})
 		It("should not allow consolidation if the budget is fully blocking during a scheduled time", func() {
 			// We're going to define a budget that doesn't allow any drift to happen
@@ -472,7 +468,7 @@ var _ = Describe("Consolidation", Ordered, func() {
 			env.ExpectCreated(nodeClass, nodePool, dep)
 
 			env.EventuallyExpectCreatedNodeClaimCount("==", 5)
-			env.EventuallyExpectCreatedNodeCount("==", 5)
+			nodes := env.EventuallyExpectCreatedNodeCount("==", 5)
 			env.EventuallyExpectHealthyPodCount(selector, int(numPods))
 
 			dep.Spec.Replicas = lo.ToPtr[int32](1)
@@ -480,7 +476,7 @@ var _ = Describe("Consolidation", Ordered, func() {
 			// Update the deployment to only contain 1 replica.
 			env.ExpectUpdated(dep)
 
-			env.ConsistentlyExpectNoDisruptions(5, time.Minute)
+			env.ConsistentlyExpectNodesNotDisrupted(nodes, time.Minute)
 		})
 	})
 	DescribeTable("should consolidate nodes (delete)", Label(debug.NoWatch), Label(debug.NoEvents),
@@ -496,26 +492,21 @@ var _ = Describe("Consolidation", Ordered, func() {
 						Spec: karpv1.NodeClaimTemplateSpec{
 							Requirements: []karpv1.NodeSelectorRequirementWithMinValues{
 								{
-									NodeSelectorRequirement: corev1.NodeSelectorRequirement{
-										Key:      karpv1.CapacityTypeLabelKey,
-										Operator: corev1.NodeSelectorOpIn,
-										Values:   lo.Ternary(spotToSpot, []string{karpv1.CapacityTypeSpot}, []string{karpv1.CapacityTypeOnDemand}),
-									},
+									Key:      karpv1.CapacityTypeLabelKey,
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   lo.Ternary(spotToSpot, []string{karpv1.CapacityTypeSpot}, []string{karpv1.CapacityTypeOnDemand}),
 								},
 								{
-									NodeSelectorRequirement: corev1.NodeSelectorRequirement{
-										Key:      v1beta1.LabelSKUCPU,
-										Operator: corev1.NodeSelectorOpIn,
-										Values:   []string{"2", "4", "8"},
-									},
+									Key:      v1beta1.LabelSKUCPU,
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   []string{"2", "4", "8"},
 								},
 								{
-									NodeSelectorRequirement: corev1.NodeSelectorRequirement{
-										Key:      v1beta1.LabelSKUFamily,
-										Operator: corev1.NodeSelectorOpNotIn,
-										// remove some cheap burstable types so we have more control over what gets provisioned
-										Values: []string{"B"},
-									},
+
+									Key:      v1beta1.LabelSKUFamily,
+									Operator: corev1.NodeSelectorOpNotIn,
+									// remove some cheap burstable types so we have more control over what gets provisioned
+									Values: []string{"B"},
 								},
 							},
 							NodeClassRef: &karpv1.NodeClassReference{
@@ -570,7 +561,7 @@ var _ = Describe("Consolidation", Ordered, func() {
 		Entry("if the nodes are spot nodes", true),
 	)
 	DescribeTable("should consolidate nodes (replace)",
-		func(spotToSpot bool) {
+		func(spotToSpot, regional bool) {
 
 			if spotToSpot {
 				if env.InClusterController {
@@ -591,26 +582,21 @@ var _ = Describe("Consolidation", Ordered, func() {
 						Spec: karpv1.NodeClaimTemplateSpec{
 							Requirements: []karpv1.NodeSelectorRequirementWithMinValues{
 								{
-									NodeSelectorRequirement: corev1.NodeSelectorRequirement{
-										Key:      karpv1.CapacityTypeLabelKey,
-										Operator: corev1.NodeSelectorOpIn,
-										Values:   lo.Ternary(spotToSpot, []string{karpv1.CapacityTypeSpot}, []string{karpv1.CapacityTypeOnDemand}),
-									},
+									Key:      karpv1.CapacityTypeLabelKey,
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   lo.Ternary(spotToSpot, []string{karpv1.CapacityTypeSpot}, []string{karpv1.CapacityTypeOnDemand}),
 								},
 								{
-									NodeSelectorRequirement: corev1.NodeSelectorRequirement{
-										Key:      v1beta1.LabelSKUCPU,
-										Operator: corev1.NodeSelectorOpIn,
-										Values:   []string{"2", "8"},
-									},
+									Key:      v1beta1.LabelSKUCPU,
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   []string{"2", "8"},
 								},
 								{
-									NodeSelectorRequirement: corev1.NodeSelectorRequirement{
-										Key:      v1beta1.LabelSKUFamily,
-										Operator: corev1.NodeSelectorOpNotIn,
-										// remove some cheap burstable types so we have more control over what gets provisioned
-										Values: []string{"B"},
-									},
+
+									Key:      v1beta1.LabelSKUFamily,
+									Operator: corev1.NodeSelectorOpNotIn,
+									// remove some cheap burstable types so we have more control over what gets provisioned
+									Values: []string{"B"},
 								},
 							},
 							NodeClassRef: &karpv1.NodeClassReference{
@@ -622,6 +608,13 @@ var _ = Describe("Consolidation", Ordered, func() {
 					},
 				},
 			})
+			if regional {
+				nodePool.Spec.Template.Spec.Requirements = append(nodePool.Spec.Template.Spec.Requirements, karpv1.NodeSelectorRequirementWithMinValues{
+					Key:      v1beta1.LabelPlacementScope,
+					Operator: corev1.NodeSelectorOpIn,
+					Values:   []string{v1beta1.PlacementScopeRegional},
+				})
+			}
 			nodePool = env.AdaptToClusterConfig(nodePool)
 
 			var numPods int32 = 3
@@ -693,8 +686,27 @@ var _ = Describe("Consolidation", Ordered, func() {
 			By("checking that all pods are healthy")
 			env.EventuallyExpectHealthyPodCount(selector, int(numPods))
 
-			By("waiting for nodes (due to anti-affinity rules)")
-			env.ExpectCreatedNodeCount("==", int(numPods))
+			By("waiting for 8-CPU nodes (due to anti-affinity rules)")
+			sourceNodes := env.EventuallyExpectNodeCountWithSelector("==", int(numPods), labels.SelectorFromSet(map[string]string{
+				karpv1.NodePoolLabelKey: nodePool.Name,
+				v1beta1.LabelSKUCPU:     "8",
+			}))
+
+			if regional {
+				By("verifying regional source nodes have canonical and CSI zone labels")
+				Eventually(func(g Gomega) {
+					for _, sourceNode := range sourceNodes {
+						node := &corev1.Node{}
+						g.Expect(env.Client.Get(env, client.ObjectKeyFromObject(sourceNode), node)).To(Succeed())
+						g.Expect(node.Labels).To(HaveKeyWithValue(corev1.LabelTopologyZone, zones.Regional))
+						g.Expect(node.Labels).To(HaveKeyWithValue(v1beta1.LabelPlacementScope, v1beta1.PlacementScopeRegional))
+						// Azure Disk CSI publishes an empty zone for non-zonal nodes:
+						// https://github.com/kubernetes-sigs/azuredisk-csi-driver/blob/c17796139c3f65289b2e06baf20e66ec0d4b27ff/pkg/azuredisk/nodeserver.go#L352-L388
+						// (Karpenter normalizes this to the canonical regional zone "0" internally)
+						g.Expect(node.Labels).To(HaveKeyWithValue("topology.disk.csi.azure.com/zone", ""))
+					}
+				}).Should(Succeed())
+			}
 
 			By("scaling down the large deployment (leaving only small pods on each node)")
 			largeDep.Spec.Replicas = lo.ToPtr[int32](0)
@@ -724,8 +736,9 @@ var _ = Describe("Consolidation", Ordered, func() {
 
 			env.ExpectDeleted(largeDep, smallDep)
 		},
-		Entry("if the nodes are on-demand nodes", false),
-		Entry("if the nodes are spot nodes", true),
+		Entry("if the nodes are on-demand nodes", false, false),
+		Entry("if the nodes are spot nodes", true, false),
+		Entry("from regional on-demand nodes with empty CSI topology", false, true),
 	)
 	It("should consolidate on-demand nodes to spot (replace)", func() {
 		nodePool := coretest.NodePool(karpv1.NodePool{
@@ -739,26 +752,21 @@ var _ = Describe("Consolidation", Ordered, func() {
 					Spec: karpv1.NodeClaimTemplateSpec{
 						Requirements: []karpv1.NodeSelectorRequirementWithMinValues{
 							{
-								NodeSelectorRequirement: corev1.NodeSelectorRequirement{
-									Key:      karpv1.CapacityTypeLabelKey,
-									Operator: corev1.NodeSelectorOpIn,
-									Values:   []string{karpv1.CapacityTypeOnDemand},
-								},
+								Key:      karpv1.CapacityTypeLabelKey,
+								Operator: corev1.NodeSelectorOpIn,
+								Values:   []string{karpv1.CapacityTypeOnDemand},
 							},
 							{
-								NodeSelectorRequirement: corev1.NodeSelectorRequirement{
-									Key:      v1beta1.LabelSKUCPU,
-									Operator: corev1.NodeSelectorOpIn,
-									Values:   []string{"2"},
-								},
+								Key:      v1beta1.LabelSKUCPU,
+								Operator: corev1.NodeSelectorOpIn,
+								Values:   []string{"2"},
 							},
 							{
-								NodeSelectorRequirement: corev1.NodeSelectorRequirement{
-									Key:      v1beta1.LabelSKUFamily,
-									Operator: corev1.NodeSelectorOpNotIn,
-									// remove some cheap burstable types so we have more control over what gets provisioned
-									Values: []string{"B"},
-								},
+
+								Key:      v1beta1.LabelSKUFamily,
+								Operator: corev1.NodeSelectorOpNotIn,
+								// remove some cheap burstable types so we have more control over what gets provisioned
+								Values: []string{"B"},
 							},
 						},
 						NodeClassRef: &karpv1.NodeClassReference{
@@ -818,17 +826,13 @@ var _ = Describe("Consolidation", Ordered, func() {
 		nodePool.Spec.Disruption.ConsolidateAfter = karpv1.MustParseNillableDuration("0s")
 		coretest.ReplaceRequirements(nodePool,
 			karpv1.NodeSelectorRequirementWithMinValues{
-				NodeSelectorRequirement: corev1.NodeSelectorRequirement{
-					Key:      karpv1.CapacityTypeLabelKey,
-					Operator: corev1.NodeSelectorOpExists,
-				},
+				Key:      karpv1.CapacityTypeLabelKey,
+				Operator: corev1.NodeSelectorOpExists,
 			},
 			karpv1.NodeSelectorRequirementWithMinValues{
-				NodeSelectorRequirement: corev1.NodeSelectorRequirement{
-					Key:      v1beta1.LabelSKUCPU,
-					Operator: corev1.NodeSelectorOpIn,
-					Values:   []string{"2"},
-				},
+				Key:      v1beta1.LabelSKUCPU,
+				Operator: corev1.NodeSelectorOpIn,
+				Values:   []string{"2"},
 			},
 		)
 		env.ExpectUpdated(nodePool)
@@ -877,28 +881,26 @@ var _ = Describe("Node Overlay", func() {
 		nodePool.Spec.Disruption.ConsolidateAfter = karpv1.MustParseNillableDuration("0s")
 		// Allow both D-family and E-family SKUs for consolidation tests that switch between families
 		coretest.ReplaceRequirements(nodePool, karpv1.NodeSelectorRequirementWithMinValues{
-			NodeSelectorRequirement: corev1.NodeSelectorRequirement{
-				Key:      v1beta1.LabelSKUFamily,
-				Operator: corev1.NodeSelectorOpIn,
-				Values:   []string{"D", "E"},
-			},
+			Key:      v1beta1.LabelSKUFamily,
+			Operator: corev1.NodeSelectorOpIn,
+			Values:   []string{"D", "E"},
 		})
 	})
 
 	It("should consolidate an instance that is the cheapest based on a price adjustment node overlay applied", func() {
 		overlaidInstanceType := "Standard_D8s_v5"
-		pod := coretest.Pod(coretest.PodOptions{
+		deployment := coretest.Deployment(coretest.DeploymentOptions{Replicas: 1, PodOptions: coretest.PodOptions{
 			ResourceRequirements: corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
 					corev1.ResourceCPU:    resource.MustParse("1"),
 					corev1.ResourceMemory: resource.MustParse("1Gi"),
 				},
 			},
-		})
+		}})
 		nodeOverlay := coretest.NodeOverlay(karpv1alpha1.NodeOverlay{
 			Spec: karpv1alpha1.NodeOverlaySpec{
 				PriceAdjustment: lo.ToPtr("-99.99999999999%"),
-				Requirements: []corev1.NodeSelectorRequirement{
+				Requirements: []karpv1alpha1.NodeSelectorRequirement{
 					{
 						Key:      corev1.LabelInstanceTypeStable,
 						Operator: corev1.NodeSelectorOpIn,
@@ -908,24 +910,25 @@ var _ = Describe("Node Overlay", func() {
 			},
 		})
 
-		env.ExpectCreated(nodePool, nodeClass, nodeOverlay, pod)
-		env.EventuallyExpectHealthy(pod)
-		nodes := env.EventuallyExpectInitializedNodeCount("==", 1)
+		env.ExpectCreated(nodePool, nodeClass, nodeOverlay, deployment)
+		pods := env.EventuallyExpectHealthyDeployment(deployment)
+		env.EventuallyExpectInitializedNodeCount("==", 1)
+		node := env.GetNode(pods[0].Spec.NodeName)
 
-		instanceType, foundInstanceType := nodes[0].Labels[corev1.LabelInstanceTypeStable]
+		instanceType, foundInstanceType := node.Labels[corev1.LabelInstanceTypeStable]
 		Expect(foundInstanceType).To(BeTrue())
 		Expect(instanceType).To(Equal(overlaidInstanceType))
 
 		// Update overlay to target a different instance type to trigger consolidation
 		newOverlaidInstanceType := "Standard_E8s_v5"
-		nodeOverlay = coretest.ReplaceOverlayRequirements(nodeOverlay, corev1.NodeSelectorRequirement{
+		nodeOverlay = coretest.ReplaceOverlayRequirements(nodeOverlay, karpv1alpha1.NodeSelectorRequirement{
 			Key:      corev1.LabelInstanceTypeStable,
 			Operator: corev1.NodeSelectorOpIn,
 			Values:   []string{newOverlaidInstanceType},
 		})
 		env.ExpectUpdated(nodeOverlay)
 
-		nodes = env.EventuallyExpectInitializedNodeCount("==", 2)
+		nodes := env.EventuallyExpectInitializedNodeCount("==", 2)
 		nodes = lo.Filter(nodes, func(n *corev1.Node, _ int) bool {
 			_, ok := lo.Find(n.Spec.Taints, func(t corev1.Taint) bool {
 				return t.MatchTaint(&karpv1.DisruptedNoScheduleTaint)
@@ -939,18 +942,18 @@ var _ = Describe("Node Overlay", func() {
 
 	It("should consolidate an instance that is the cheapest based on a price override node overlay applied", func() {
 		overlaidInstanceType := "Standard_D8s_v5"
-		pod := coretest.Pod(coretest.PodOptions{
+		deployment := coretest.Deployment(coretest.DeploymentOptions{Replicas: 1, PodOptions: coretest.PodOptions{
 			ResourceRequirements: corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
 					corev1.ResourceCPU:    resource.MustParse("1"),
 					corev1.ResourceMemory: resource.MustParse("1Gi"),
 				},
 			},
-		})
+		}})
 		nodeOverlay := coretest.NodeOverlay(karpv1alpha1.NodeOverlay{
 			Spec: karpv1alpha1.NodeOverlaySpec{
 				Price: lo.ToPtr("0.0000000232"),
-				Requirements: []corev1.NodeSelectorRequirement{
+				Requirements: []karpv1alpha1.NodeSelectorRequirement{
 					{
 						Key:      corev1.LabelInstanceTypeStable,
 						Operator: corev1.NodeSelectorOpIn,
@@ -960,24 +963,25 @@ var _ = Describe("Node Overlay", func() {
 			},
 		})
 
-		env.ExpectCreated(nodePool, nodeClass, nodeOverlay, pod)
-		env.EventuallyExpectHealthy(pod)
-		nodes := env.EventuallyExpectInitializedNodeCount("==", 1)
+		env.ExpectCreated(nodePool, nodeClass, nodeOverlay, deployment)
+		pods := env.EventuallyExpectHealthyDeployment(deployment)
+		env.EventuallyExpectInitializedNodeCount("==", 1)
+		node := env.GetNode(pods[0].Spec.NodeName)
 
-		instanceType, foundInstanceType := nodes[0].Labels[corev1.LabelInstanceTypeStable]
+		instanceType, foundInstanceType := node.Labels[corev1.LabelInstanceTypeStable]
 		Expect(foundInstanceType).To(BeTrue())
 		Expect(instanceType).To(Equal(overlaidInstanceType))
 
 		// Update overlay to target a different instance type to trigger consolidation
 		newOverlaidInstanceType := "Standard_E8s_v5"
-		nodeOverlay = coretest.ReplaceOverlayRequirements(nodeOverlay, corev1.NodeSelectorRequirement{
+		nodeOverlay = coretest.ReplaceOverlayRequirements(nodeOverlay, karpv1alpha1.NodeSelectorRequirement{
 			Key:      corev1.LabelInstanceTypeStable,
 			Operator: corev1.NodeSelectorOpIn,
 			Values:   []string{newOverlaidInstanceType},
 		})
 		env.ExpectUpdated(nodeOverlay)
 
-		nodes = env.EventuallyExpectInitializedNodeCount("==", 2)
+		nodes := env.EventuallyExpectInitializedNodeCount("==", 2)
 		nodes = lo.Filter(nodes, func(n *corev1.Node, _ int) bool {
 			_, ok := lo.Find(n.Spec.Taints, func(t corev1.Taint) bool {
 				return t.MatchTaint(&karpv1.DisruptedNoScheduleTaint)

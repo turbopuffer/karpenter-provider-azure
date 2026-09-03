@@ -27,6 +27,10 @@ const (
 	NetworkDataplaneCilium = "cilium"
 	NetworkDataplaneAzure  = "azure"
 
+	// NetworkPolicy values (matched case-insensitively).
+	NetworkPolicyCilium = "cilium"
+	NetworkPolicyCalico = "calico"
+
 	StorageProfileManagedDisks = "ManagedDisks"
 	StorageProfileEphemeral    = "Ephemeral"
 
@@ -37,9 +41,17 @@ const (
 	DefaultNodeSubnetMaxPods    = 30
 	DefaultKubernetesMaxPods    = 110
 
-	ProvisionModeAKSScriptless       = "aksscriptless"
-	ProvisionModeBootstrappingClient = "bootstrappingclient"
-	ProvisionModeAKSMachineAPI       = "aksmachineapi"
+	ProvisionModeAKSScriptless            = "aksscriptless"
+	ProvisionModeBootstrappingClient      = "bootstrappingclient"
+	ProvisionModeAKSMachineAPI            = "aksmachineapi"
+	ProvisionModeAKSMachineAPIHeaderBatch = "aksmachineapiheaderbatch"
+
+	AKSMachineAPIHeaderBatchMaxSize = 50
+
+	// Compute recommendation mode values.
+	ComputeRecommendationModeDisabled = "disabled"
+	ComputeRecommendationModeLog      = "log-only"
+	ComputeRecommendationModeEnabled  = "enabled"
 
 	// Provisioning states for AKS Machine objects.
 	// The SDK's Machine.Properties.ProvisioningState is typed as *string (no typed constants).

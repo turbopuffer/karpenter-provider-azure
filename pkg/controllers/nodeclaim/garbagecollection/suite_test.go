@@ -47,6 +47,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/test"
 	. "github.com/Azure/karpenter-provider-azure/pkg/test/expectations"
 	corecloudprovider "sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -90,7 +91,7 @@ var _ = BeforeSuite(func() {
 	networkInterfaceGCController = garbagecollection.NewNetworkInterface(env.Client, azureEnv.VMInstanceProvider)
 	fakeClock = &clock.FakeClock{}
 	cluster = state.NewCluster(fakeClock, env.Client, cloudProvider)
-	prov = provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, fakeClock)
+	prov = provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, fakeClock, deviceallocation.NewController(env.Client))
 
 })
 
@@ -118,7 +119,7 @@ var _ = BeforeEach(func() {
 	})
 
 	cluster.Reset()
-	azureEnv.Reset()
+	azureEnv.Reset(ctx)
 })
 
 var _ = AfterEach(func() {
@@ -186,7 +187,7 @@ var _ = Describe("Instance Garbage Collection", func() {
 								TimeCreated: lo.ToPtr(time.Now().Add(-time.Minute * 10)),
 							},
 						})
-						azureEnv.VirtualMachinesAPI.Instances.Store(lo.FromPtr(newVM.ID), newVM)
+						azureEnv.VirtualMachinesAPI.Instances.Store(lo.FromPtr(newVM.ID), *newVM)
 						ids = append(ids, *vm.ID)
 					}
 				}
@@ -227,7 +228,7 @@ var _ = Describe("Instance Garbage Collection", func() {
 								TimeCreated: lo.ToPtr(time.Now().Add(-time.Minute * 10)),
 							},
 						})
-						azureEnv.VirtualMachinesAPI.Instances.Store(lo.FromPtr(newVM.ID), newVM)
+						azureEnv.VirtualMachinesAPI.Instances.Store(lo.FromPtr(newVM.ID), *newVM)
 						nodeClaim := coretest.NodeClaim(karpv1.NodeClaim{
 							Status: karpv1.NodeClaimStatus{
 								ProviderID: utils.VMResourceIDToProviderID(ctx, *vm.ID),

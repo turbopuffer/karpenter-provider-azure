@@ -32,11 +32,12 @@ import (
 )
 
 const (
-	AzureLinuxGen2ImageDefinition      = "V2gen2"
-	AzureLinuxGen1ImageDefinition      = "V2"
-	AzureLinuxGen2ArmImageDefinition   = "V2gen2arm64"
-	AzureLinux2Gen2FIPSImageDefinition = "V2gen2fips"
-	AzureLinux2Gen1FIPSImageDefinition = "V2fips"
+	AzureLinuxGen2ImageDefinition               = "V2gen2"
+	AzureLinuxGen1ImageDefinition               = "V2"
+	AzureLinuxGen2ArmImageDefinition            = "V2gen2arm64"
+	AzureLinux2Gen2FIPSImageDefinition          = "V2gen2fips"
+	AzureLinux2Gen1FIPSImageDefinition          = "V2fips"
+	AzureLinux2Gen2TrustedLaunchImageDefinition = "V2gen2TL"
 )
 
 type AzureLinux struct {
@@ -47,7 +48,7 @@ func (u AzureLinux) Name() string {
 	return "AzureLinux2"
 }
 
-func (u AzureLinux) DefaultImages(useSIG bool, fipsMode *v1beta1.FIPSMode) []types.DefaultImageOutput {
+func (u AzureLinux) DefaultImages(useSIG bool, fipsMode *v1beta1.FIPSMode, trustedLaunch bool) []types.DefaultImageOutput {
 	if lo.FromPtr(fipsMode) == v1beta1.FIPSModeFIPS {
 		// Note: FIPS images aren't supported in public galleries, only shared image galleries
 		// image provider will select these images in order, first match wins
@@ -79,6 +80,22 @@ func (u AzureLinux) DefaultImages(useSIG bool, fipsMode *v1beta1.FIPSMode) []typ
 			},
 		}
 	}
+	if trustedLaunch {
+		return []types.DefaultImageOutput{
+			{
+				PublicGalleryURL:     AKSAzureLinuxPublicGalleryURL,
+				GalleryResourceGroup: AKSAzureLinuxResourceGroup,
+				GalleryName:          AKSAzureLinuxGalleryName,
+				ImageDefinition:      AzureLinux2Gen2TrustedLaunchImageDefinition,
+				Requirements: scheduling.NewRequirements(
+					scheduling.NewRequirement(v1.LabelArchStable, v1.NodeSelectorOpIn, karpv1.ArchitectureAmd64),
+					scheduling.NewRequirement(v1beta1.LabelSKUHyperVGeneration, v1.NodeSelectorOpIn, v1beta1.HyperVGenerationV2),
+				),
+				Distro: "aks-azurelinux-v2-gen2-tl",
+			},
+		}
+	}
+	// image provider will select these images in order, first match wins. This is why we chose to put Gen2 first in the defaultImages, as we prefer gen2 over gen1
 	// Use AzureLinux3 for both x64 (has NVMe disk controller support in CIG, needed for NVMe-only VMs like
 	// L-series v4) and ARM64. The CIG V3gen2arm64 metadata bug (azure/aks#5670) that previously forced
 	// AzureLinux2 on the CIG path has since been fixed.
@@ -131,17 +148,18 @@ func (u AzureLinux) ScriptlessCustomData(
 ) bootstrap.Bootstrapper {
 	return bootstrap.AKS{
 		Options: bootstrap.Options{
-			ClusterName:      u.Options.ClusterName,
-			ClusterEndpoint:  u.Options.ClusterEndpoint,
-			KubeletConfig:    kubeletConfig,
-			Taints:           taints,
-			Labels:           labels,
-			CABundle:         caBundle,
-			GPUNode:          u.Options.GPUNode,
-			GPUDriverVersion: u.Options.GPUDriverVersion,
-			GPUDriverType:    u.Options.GPUDriverType,
-			GPUImageSHA:      u.Options.GPUImageSHA,
-			SubnetID:         u.Options.SubnetID,
+			ClusterName:                  u.Options.ClusterName,
+			ClusterEndpoint:              u.Options.ClusterEndpoint,
+			KubeletConfig:                kubeletConfig,
+			Taints:                       taints,
+			Labels:                       labels,
+			CABundle:                     caBundle,
+			GPUNode:                      u.Options.GPUNode,
+			GPUDriverVersion:             u.Options.GPUDriverVersion,
+			GPUDriverType:                u.Options.GPUDriverType,
+			GPUImageSHA:                  u.Options.GPUImageSHA,
+			GPUDriverInstallationEnabled: u.Options.GPUDriverInstallationEnabled,
+			SubnetID:                     u.Options.SubnetID,
 		},
 		Arch:                           u.Options.Arch,
 		TenantID:                       u.Options.TenantID,
@@ -149,7 +167,8 @@ func (u AzureLinux) ScriptlessCustomData(
 		Location:                       u.Options.Location,
 		KubeletIdentityClientID:        u.Options.KubeletIdentityClientID,
 		ResourceGroup:                  u.Options.ResourceGroup,
-		ClusterID:                      u.Options.ClusterID,
+		NetworkSecurityGroupName:       u.Options.NetworkSecurityGroupName,
+		RouteTableName:                 u.Options.RouteTableName,
 		APIServerName:                  u.Options.APIServerName,
 		KubeletClientTLSBootstrapToken: u.Options.KubeletClientTLSBootstrapToken,
 		NetworkPlugin:                  u.Options.NetworkPlugin,
@@ -171,6 +190,9 @@ func (u AzureLinux) CustomScriptsNodeBootstrapping(
 	fipsMode *v1beta1.FIPSMode,
 	localDNS *v1beta1.LocalDNS,
 	artifactStreaming *v1beta1.ArtifactStreaming,
+	linuxOSConfig *v1beta1.LinuxOSConfiguration,
+	vtpmEnabled *bool,
+	secureBootEnabled *bool,
 ) customscriptsbootstrap.Bootstrapper {
 	return customscriptsbootstrap.ProvisionClientBootstrap{
 		ClusterName:                    u.Options.ClusterName,
@@ -188,10 +210,14 @@ func (u AzureLinux) CustomScriptsNodeBootstrapping(
 		InstanceType:                   instanceType,
 		StorageProfile:                 storageProfile,
 		ClusterResourceGroup:           u.Options.ClusterResourceGroup,
+		GPUDriverInstallationEnabled:   u.Options.GPUDriverInstallationEnabled,
 		NodeBootstrappingProvider:      nodeBootstrappingClient,
 		OSSKU:                          customscriptsbootstrap.ImageFamilyOSSKUAzureLinux2,
 		FIPSMode:                       fipsMode,
 		LocalDNSProfile:                localDNS,
 		ArtifactStreaming:              artifactStreaming,
+		LinuxOSConfig:                  linuxOSConfig,
+		VTPMEnabled:                    vtpmEnabled,
+		SecureBootEnabled:              secureBootEnabled,
 	}
 }
