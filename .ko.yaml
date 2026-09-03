@@ -2,5 +2,6 @@ defaultBaseImage: mcr.microsoft.com/azurelinux/distroless/base:3.0@sha256:178f25
 defaultPlatforms:
   - linux/arm64
   - linux/amd64
+# upstream needs cgo for their MS-Go systemcrypto FIPS build, ours uses stock Go GOFIPS140
 defaultEnv:
-  - CGO_ENABLED=1
+  - CGO_ENABLED=0
